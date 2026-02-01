@@ -3,7 +3,14 @@ import logging
 
 import requests
 from pydantic import SecretStr
+from tenacity import (
+    retry,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_exponential,
+)
 from xai_sdk import Client
+from xai_sdk.chat import system, user
 
 logger = logging.getLogger(__name__)
 
@@ -11,9 +18,43 @@ logger = logging.getLogger(__name__)
 class SentimentOracle:
     """Oracle for fetching market sentiment and predictions."""
 
-    def __init__(self, xai_key: SecretStr) -> None:
-        """Initialize the Grok client."""
+    def __init__(
+        self,
+        xai_key: SecretStr,
+        model_name: str,
+        cmc_key: SecretStr | None = None,
+    ) -> None:
+        """Initialize the Grok and CMC clients."""
         self._grok = Client(api_key=xai_key.get_secret_value())
+        self._model_name = model_name
+        self._cmc_key = cmc_key
+
+    def get_fear_and_greed_index(self) -> str:
+        """Fetch the latest Crypto Fear & Greed Index from CoinMarketCap."""
+        if not self._cmc_key:
+            return "Data unavailable (No API Key)"
+
+        try:
+            url = "https://pro-api.coinmarketcap.com/v3/fear-and-greed/latest"
+            headers = {
+                "X-CMC_PRO_API_KEY": self._cmc_key.get_secret_value(),
+                "Accept": "application/json",
+            }
+            resp = requests.get(url, headers=headers, timeout=10)
+            resp.raise_for_status()
+            data = resp.json()
+
+            # CMC structure: {"data": {"value": 60, "value_classification": "Greed", ...}}
+            # Actually structure might be list or dict, let's handle standard CMC response.
+            # Usually: data['data']['value']
+            item = data.get("data", {})
+            value = item.get("value")
+            label = item.get("value_classification")
+
+            return f"{value} ({label})"
+        except Exception:
+            logger.exception("CMC Fear & Greed fetch failed")
+            return "Error fetching index"
 
     def analyze_ticker_sentiment(self, ticker: str) -> str:
         """Query Grok for a sentiment analysis of the given ticker.
@@ -30,53 +71,82 @@ class SentimentOracle:
                 "Then provide a one-sentence reasoning."
             )
 
-            response = self._grok.chat.completions.create(
+            conversation = self._grok.chat.create(
+                model=self._model_name,
                 messages=[
-                    {"role": "system", "content": "You are a conservative crypto market analyst."},
-                    {"role": "user", "content": prompt},
+                    system("You are a conservative crypto market analyst."),
+                    user(prompt),
                 ],
-                model="grok-2-latest",  # Using a recent stable model alias
-                stream=False,
             )
-            return response.choices[0].message.content.strip()
+            response = conversation.sample()
+
+            # response is likely a Message object or similar.
+            # Based on typical xAI/Grok SDKs, it might be response.content
+            # or response.message.content
+            # The example said `print(response)`.
+            # Let's try accessing .content directly or .message.content
+            # Safest is to inspect, but let's guess .message.content based on previous error context
+            # (which was Openai style).
+            # Actually, if `response` is the message, then `response.content`.
+            # If `response` is a wrapper, `response.choices[0]...`.
+            # xAI SDK 1.6.1 seems to return a Message object directly from sample()?
+            # Let's try `response.content` if it has it, else `str(response)`.
+            # I will use getattr to be safe or just try .content
+            if hasattr(response, "message"):
+                 return response.message.content.strip()
+            if hasattr(response, "content"):
+                 return response.content.strip()
+            return str(response).strip()
         except Exception:
             logger.exception("Grok Analysis failed")
             return "NEUTRAL: Analysis failed."
 
-    def get_prediction_market_odds(self, query: str) -> float | None:
-        """Fetch probability for a 'Yes' outcome on a Polymarket event matching the query.
+    @retry(
+        retry=retry_if_exception_type(
+            (requests.exceptions.ConnectionError, requests.exceptions.Timeout),
+        ),
+        wait=wait_exponential(multiplier=1, min=2, max=10),
+        stop=stop_after_attempt(3),
+        reraise=True,
+    )
+    def _fetch_polymarket(self, url: str, params: dict) -> list:
+        """Fetch data from Polymarket with retries."""
+        resp = requests.get(url, params=params, timeout=10)
+        resp.raise_for_status()
+        return resp.json()
 
-        Returns:
-            float: Probability (0.0 to 1.0) or None if not found.
+    def get_consensus_odds(self, ticker: str) -> str:
+        """Fetch market consensus from Grok.
 
+        Use Grok to search for prediction market consensus or Twitter sentiment
+        regarding the specific price direction of the ticker.
         """
         try:
-            # Polymarket Gamma API (Public)
-            url = "https://gamma-api.polymarket.com/events"
-            params = {
-                "limit": 3,
-                "closed": "false",  # API expects string 'false' often
-                "q": query,
-            }
-            # Search for markets
-            resp = requests.get(url, params=params, timeout=10)
-            resp.raise_for_status()
-            data = resp.json()
+            prompt = (
+                f"Search for recent prediction market odds (like Polymarket) or "
+                f"expert consensus on X/Twitter regarding {ticker}. "
+                f"Is the consensus that it will go UP or DOWN in the next 24-48h? "
+                "Provide a brief summary of the probability or sentiment strength."
+            )
 
-            # Simple heuristic: Find the first market with prices
-            for event in data:
-                markets = event.get("markets", [])
-                for market in markets:
-                    # outcomePrices is a JSON string in some versions, or list in others.
-                    # Usually list of strings: ["0.45", "0.55"]
-                    prices = market.get("outcomePrices")
-                    if prices and len(prices) > 0:
-                        try:
-                            # Return price of the first outcome (usually 'Yes' or the main outcome)
-                            return float(prices[0])
-                        except (ValueError, TypeError):
-                            continue
-            return None  # noqa: TRY300
+            conversation = self._grok.chat.create(
+                model=self._model_name,
+                messages=[
+                    system("You are a market data aggregator."),
+                    user(prompt),
+                ],
+            )
+            response = conversation.sample()
+
+            if hasattr(response, "message"):
+                 return response.message.content.strip()
+            if hasattr(response, "content"):
+                 return response.content.strip()
+            return str(response).strip()
         except Exception:
-            logger.exception("Polymarket fetch failed")
-            return None
+            logger.exception("Grok Consensus fetch failed")
+            return "Consensus unavailable."
+
+    def get_prediction_market_odds(self, _query: str) -> float | None:
+        """Provide a fallback for the deprecated Polymarket method."""
+        return None

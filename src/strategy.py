@@ -5,7 +5,14 @@ from typing import Literal
 
 from google import genai
 from google.genai import types
+from google.genai.errors import ClientError, ServerError
 from pydantic import BaseModel, SecretStr
+from tenacity import (
+    retry,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_exponential,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -22,26 +29,50 @@ class TradeSignal(BaseModel):
 class Strategist:
     """AI Strategist that reviews market data to form a decision."""
 
-    def __init__(self, api_key: SecretStr, model_name: str = "gemini-2.0-flash") -> None:
+    def __init__(self, api_key: SecretStr, model_name: str) -> None:
         """Initialize the Gemini client."""
         self._client = genai.Client(api_key=api_key.get_secret_value())
         self._model_name = model_name
+        self._fallbacks = [model_name, "gemini-3-flash-preview", "gemini-2.5-flash"]
+
+    @retry(
+        retry=retry_if_exception_type((ClientError, ServerError)),
+        wait=wait_exponential(multiplier=1, min=4, max=60),
+        stop=stop_after_attempt(3),
+        reraise=True,
+    )
+    def _call_gemini(self, model: str, prompt: str) -> str:
+        """Call Gemini with retries."""
+        response = self._client.models.generate_content(
+            model=model,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+            ),
+        )
+        return response.text
 
     def generate_signal(
         self,
         ticker: str,
         current_price: float,
         sentiment: str,
-        prediction_odds: float | None,
+        consensus: str,
+        fear_greed: str,
+        history: str,
     ) -> TradeSignal:
-        """Ask Gemini to review the data and issue a trade signal."""
+        """Review data and issue a signal with fallback."""
         prompt = f"""
         You are a conservative algorithmic crypto trader.
         Review the following data for {ticker}:
 
         - Current Price: ${current_price}
-        - Market Sentiment (Grok/Twitter): "{sentiment}"
-        - Prediction Market Odds (Polymarket): {prediction_odds if prediction_odds else 'N/A'}
+        - Market Sentiment (Grok): "{sentiment}"
+        - Consensus/Odds (Grok Search): "{consensus}"
+        - Fear & Greed Index: "{fear_greed}"
+
+        Recent Trade History (Context):
+        {history}
 
         Your Goal: Decide whether to BUY, SELL, or HOLD.
 
@@ -57,28 +88,31 @@ class Strategist:
         }}
         """
 
-        try:
-            response = self._client.models.generate_content(
-                model=self._model_name,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                ),
-            )
+        last_error = None
+        for model in self._fallbacks:
+            try:
+                logger.info("Strategy: Attempting %s for %s...", model, ticker)
+                text = self._call_gemini(model, prompt)
+                data = json.loads(text)
+                return TradeSignal(**data)
+            except (ClientError, ServerError) as e:
+                last_error = e
+                logger.warning(
+                    "Strategy: %s failed for %s: %s. Trying fallback...",
+                    model, ticker, e,
+                )
+                continue
+            except Exception:
+                logger.exception("Strategy: Unexpected error with %s", model)
+                continue
 
-            # Parse JSON
-            # response.text is directly available in new SDK usually.
-            # or response.candidates[0].content.parts[0].text
-            # The new SDK helper often exposes `.text` property on the response object.
-            # Let's verify or assume it behaves like the old one in terms of .text accessor.
-            # Actually, `google-genai` response object has `.text` property.
-            data = json.loads(response.text)
-            return TradeSignal(**data)
-
-        except Exception:
-            logger.exception("Strategy generation failed")
-            return TradeSignal(
-                action="HOLD",
-                confidence=0.0,
-                reasoning="Error in strategy layer.",
-            )
+        # If all fail
+        logger.error(
+            "Strategy: All Gemini models failed. Last error: %s",
+            last_error,
+        )
+        return TradeSignal(
+            action="HOLD",
+            confidence=0.0,
+            reasoning=f"Strategy layer exhausted all fallbacks. Last error: {last_error}",
+        )

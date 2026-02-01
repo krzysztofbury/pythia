@@ -18,6 +18,13 @@ class KrakenExchange:
             "secret": private_key.get_secret_value(),
             "enableRateLimit": True,
         })
+        self._markets = None
+
+    def symbol_exists(self, symbol: str) -> bool:
+        """Check if the exchange supports this symbol."""
+        if self._markets is None:
+            self._markets = self._client.load_markets()
+        return symbol in self._markets
 
     def fetch_price(self, symbol: str) -> float:
         """Fetch the current last price for a symbol."""
@@ -107,6 +114,36 @@ class KrakenExchange:
             symbol=symbol,
             type="limit",
             side="buy",
+            amount=amount,
+            price=price,
+            params=params,
+        )
+
+    def cancel_all_orders(self, symbol: str) -> dict[str, Any]:
+        """Cancel all open orders for a specific symbol."""
+        logger.info("I: Cancelling all open orders for %s", symbol)
+        # ccxt Kraken implementation for cancel_all_orders might need params
+        return self._client.cancel_all_orders(symbol)
+
+    def place_maker_sell(self, symbol: str, price: float, amount: float) -> dict[str, Any]:
+        """Place a LIMIT SELL order with POST-ONLY flag.
+        
+        Safety: Enforces 'limit' and 'postOnly'.
+        """
+        if price <= 0:
+            msg = "Price must be positive"
+            raise ValueError(msg)
+        if amount <= 0:
+            msg = "Amount must be positive"
+            raise ValueError(msg)
+
+        params = {"postOnly": True}
+        logger.info("I: Placing STRATEGIC MAKER SELL on %s: %s @ %s", symbol, amount, price)
+
+        return self._client.create_order(
+            symbol=symbol,
+            type="limit",
+            side="sell",
             amount=amount,
             price=price,
             params=params,

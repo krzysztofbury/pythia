@@ -7,6 +7,7 @@ import time
 
 from config import Settings
 from exchange import KrakenExchange
+from journal import TradeJournal
 from sentiment import SentimentOracle
 from strategy import Strategist, TradeSignal
 
@@ -24,6 +25,7 @@ logger = logging.getLogger("OraclePythia")
 # Constants
 MIN_CONFIDENCE = 0.7
 MIN_ORDER_USD = 10.0
+ROUND_UP_THRESHOLD = 8.3
 
 
 class RiskGuardian:
@@ -36,7 +38,7 @@ class RiskGuardian:
 
     def check_liquidity(self, symbol: str) -> bool:
         """Check if the market liquidity (spread) is healthy.
-        
+
         Returns:
             True if spread is acceptable (< max_spread_pct), False otherwise.
 
@@ -87,11 +89,24 @@ class RiskGuardian:
         # 1. Spread Check
         return self.check_liquidity(ticker)
 
-    def check_buy(self, symbol: str, price: float, signal: TradeSignal) -> float:
-        """Validate a BUY signal.
+    def check_sell(self, symbol: str) -> float:
+        """Validate a SELL signal.
 
-        Returns the safe amount to buy (or 0.0 if rejected).
+        Returns the total balance to sell (or 0.0 if nothing held).
         """
+        base_currency = symbol.split("/")[0]
+        balance = self.exchange.get_free_balance(base_currency)
+
+        # Threshold to ignore dust (Kraken has mins, usually > 0.0001)
+        if balance < 0.0001:
+            logger.info("Guardian: SELL ignored for %s. No significant balance found.", symbol)
+            return 0.0
+
+        logger.info("Guardian: APPROVED SELL %s: total balance %s", symbol, balance)
+        return balance
+
+    def check_buy(self, symbol: str, price: float, signal: TradeSignal) -> float:
+        """Validate a BUY signal with dynamic position sizing."""
         if signal.action != "BUY":
             return 0.0
 
@@ -103,15 +118,38 @@ class RiskGuardian:
             )
             return 0.0
 
-        # Rule 2: Max Position Size (Tuition Cap)
-        target_usd = self.settings.max_position_size_usd
+        # Rule 2: Dynamic Position Sizing (Balance / Universe Size)
+        try:
+            total_balance = self.exchange.get_free_balance(self.settings.quote_currency)
+            universe_size = len(self.settings.universe_list)
 
-        # Rule 3: Balance Check
-        balance = self.exchange.get_free_balance("USD")
-        if balance < target_usd:
+            # Divide total starting balance by universe size
+            calculated_size = total_balance / universe_size
+
+            # Apply Safety Cap (Tuition Cap) from settings
+            target_usd = min(calculated_size, self.settings.max_position_size_usd)
+
+            # Rule 2.5: Kraken Minimum Fulfillment
+            if ROUND_UP_THRESHOLD <= target_usd < MIN_ORDER_USD:
+                logger.info(
+                    "Guardian: Rounding up %s to $%s for Kraken.",
+                    target_usd, MIN_ORDER_USD,
+                )
+                target_usd = MIN_ORDER_USD
+
+            logger.info(
+                "Guardian: Calculated allocation for %s: %s (Cap: %s)",
+                symbol, calculated_size, self.settings.max_position_size_usd,
+            )
+        except Exception:
+            logger.exception("Guardian: Failed to calculate position size")
+            return 0.0
+
+        # Rule 3: Minimum Balance Check
+        if total_balance < target_usd:
             logger.warning(
-                "Guardian: Insufficient funds. Have $%s, need $%s",
-                balance, target_usd,
+                "Guardian: Insufficient %s funds for %s. Have %s, need %s",
+                self.settings.quote_currency, symbol, total_balance, target_usd,
             )
             return 0.0
 
@@ -121,7 +159,8 @@ class RiskGuardian:
         # Rule 4: Minimum Order Size
         if target_usd < MIN_ORDER_USD:
             logger.warning(
-                "Guardian: Order value too low for Kraken (usually ~$10 min).",
+                "Guardian: Target value %s too low for Kraken (min ~$10).",
+                target_usd,
             )
             return 0.0
 
@@ -132,26 +171,39 @@ class RiskGuardian:
         return amount
 
 
-def run_cycle() -> None:  # noqa: C901, PLR0915
+def run_cycle(settings: Settings) -> None:  # noqa: C901, PLR0915, PLR0912
     """Execute one complete trading analysis cycle (Sniper Mode)."""
-    try:
-        settings = Settings()
-    except Exception:
-        logger.exception("Failed to load settings")
-        return
-
     logger.info("Starting Sniper Cycle. Mode: %s", settings.trading_mode)
 
     try:
         exchange = KrakenExchange(settings.kraken_api_key, settings.kraken_private_key)
-        oracle = SentimentOracle(settings.xai_api_key)
+        oracle = SentimentOracle(
+            settings.xai_api_key,
+            settings.xai_model,
+            settings.cmc_api_key,
+        )
         strategist = Strategist(settings.google_api_key, settings.gemini_model)
         guardian = RiskGuardian(settings, exchange)
+        journal = TradeJournal()
     except Exception:
         logger.exception("Component initialization failed")
         return
 
+    # Fetch recent history once per cycle
+    history = journal.get_recent_history()
+
+    # Fetch Broad Market Sentiment (Fear & Greed) once per cycle
+    fear_greed = oracle.get_fear_and_greed_index()
+    logger.info("Market Sentiment: Fear & Greed Index = %s", fear_greed)
+
     for ticker in settings.universe_list:
+        if not exchange.symbol_exists(ticker):
+            logger.warning("Sniper: Skipping %s. Symbol not supported by Kraken.", ticker)
+            continue
+
+        # Fetch recent history for this specific ticker
+        history = journal.get_recent_history(ticker=ticker)
+
         logger.info("Scanning %s...", ticker)
 
         try:
@@ -160,12 +212,9 @@ def run_cycle() -> None:  # noqa: C901, PLR0915
                 continue
 
             # 1. Cold Facts Check (Mean Reversion & Volume Risk)
-            # Fetch 24h stats first to avoid wasting API calls on bad candidates
             stats = exchange.get_24h_stats(ticker)
             price = exchange.fetch_price(ticker)
-
             vwap = stats["vwap"]
-            # Requirement: Price < 24h Avg * 0.98 (2% dip)
             target_entry = vwap * 0.98
 
             if price > target_entry:
@@ -181,59 +230,86 @@ def run_cycle() -> None:  # noqa: C901, PLR0915
 
             # 3. AI Analysis
             sentiment = oracle.analyze_ticker_sentiment(ticker)
+            consensus = oracle.get_consensus_odds(ticker)
+
             # Circuit Breaker: Regulatory Ban check
             if "BAN" in sentiment.upper() or "REGULATORY" in sentiment.upper():
-                logger.warning(
-                    "Sniper: Regulatory Risk detected in sentiment for %s. Abort.",
-                    ticker,
-                )
+                logger.warning("Sniper: Regulatory Risk detected for %s. Abort.", ticker)
                 continue
 
-            odds = oracle.get_prediction_market_odds(f"Will {ticker.split('/')[0]} go up?")
-
             logger.info(
-                "Data: Price=$%s (Target <$%s), Sentiment=%s..., Odds=%s",
-                price, target_entry, sentiment[:30], odds,
+                "Data: Price=$%s (Target <$%s), Sentiment=%s..., Consensus=%s...",
+                price, target_entry, sentiment[:30], consensus[:30],
             )
 
             # 4. Strategy Decision
-            signal = strategist.generate_signal(ticker, price, sentiment, odds)
+            signal = strategist.generate_signal(
+                ticker, price, sentiment, consensus, fear_greed, history,
+            )
             logger.info(
                 "Signal: %s (Conf: %s) - %s",
                 signal.action, signal.confidence, signal.reasoning,
             )
 
-            # 5. Execution (Sniper Entry)
+            # 5. Execution
             if signal.action == "BUY":
-                # Sniper: Place Limit Buy at 0.5% below current price
                 limit_price = price * 0.995
-
                 amount = guardian.check_buy(ticker, limit_price, signal)
-
                 if amount > 0:
+                    journal.log_trade(
+                        account="Kraken", instrument=ticker, side="BUY",
+                        price=limit_price, quantity=amount, value=limit_price * amount,
+                        currency=settings.quote_currency, reasoning=signal.reasoning,
+                    )
                     if settings.trading_mode == "LIVE":
-                        logger.info(">>> EXECUTING LIVE SNIPER ORDER <<<")
-                        # 1. Place Entry
+                        logger.info(">>> EXECUTING LIVE SNIPER BUY <<<")
                         exchange.place_maker_buy(ticker, limit_price, amount)
-
-                        # 2. Place Protection (SL/TP)
                         sl_price = limit_price * (1 - settings.stop_loss_pct)
                         tp_price = limit_price * (1 + settings.take_profit_pct)
-
                         exchange.place_protection_orders(
                             ticker, amount, limit_price, sl_price, tp_price,
                         )
-                        logger.info(
-                            "Protection Orders Set: SL=$%s, TP=$%s",
-                            sl_price, tp_price,
-                        )
                     else:
-                        logger.info(
-                            ">>> PAPER SNIPER: Order Simulated @ $%s <<<",
-                            limit_price,
-                        )
+                        logger.info(">>> PAPER SNIPER: BUY Order Recorded @ $%s <<<", limit_price)
 
-            # Rate limit sleep
+            elif signal.action == "SELL":
+                amount_to_sell = guardian.check_sell(ticker)
+                if amount_to_sell > 0:
+                    # TAX Calculation: Fetch last buy price
+                    buy_price = journal.get_last_buy_price(ticker)
+                    profit = 0.0
+                    tax = 0.0
+
+                    if buy_price:
+                        # Profit per unit * quantity
+                        profit = (price - buy_price) * amount_to_sell
+                        # Polish Capital Gains Tax (19%)
+                        if profit > 0:
+                            tax = profit * 0.19
+                            logger.info(
+                                "Tax: Realized profit of %s %s. Tax liability: %s",
+                                profit, settings.quote_currency, tax,
+                            )
+
+                    journal.log_trade(
+                        account="Kraken", instrument=ticker, side="SELL",
+                        price=price, quantity=amount_to_sell, value=price * amount_to_sell,
+                        currency=settings.quote_currency,
+                        reasoning=f"Strategic Exit: {signal.reasoning}",
+                        profit=profit, tax=tax,
+                    )
+
+                    if settings.trading_mode == "LIVE":
+                        logger.info(">>> EXECUTING LIVE STRATEGIC SELL <<<")
+                        # 1. MUST Cancel existing protection orders (SL/TP) first
+                        exchange.cancel_all_orders(ticker)
+                        # 2. Place Limit Sell at current price (Maker)
+                        exchange.place_maker_sell(ticker, price, amount_to_sell)
+                    else:
+                        logger.info(">>> PAPER SNIPER: SELL Order Recorded @ $%s <<<", price)
+
+
+
             time.sleep(2)
 
         except Exception:
@@ -245,7 +321,7 @@ def run_cycle() -> None:  # noqa: C901, PLR0915
 
 def main() -> None:
     """Entry point for the bot."""
-    # Graceful Shutdown Handling
+    logger.info("--- ORACLE PYTHIA BOOTING VERSION 3.0 ---")
     shutdown_event = threading.Event()
 
     def signal_handler(_signum: int, _frame: object) -> None:
@@ -257,14 +333,17 @@ def main() -> None:
 
     logger.info("Oracle Pythia Bot Started.")
 
-    while not shutdown_event.is_set():
-        run_cycle()
+    try:
+        settings = Settings()
+    except Exception:
+        logger.critical("Failed to load initial settings. Exiting.")
+        return
 
-        # Sleep for 1 hour, but wake up if shutdown signal is received
+    while not shutdown_event.is_set():
+        run_cycle(settings)
         if not shutdown_event.is_set():
-            logger.info("Sleeping for 1 hour...")
-            # wait returns True if flag is set (shutdown), False if timeout (loop continues)
-            if shutdown_event.wait(timeout=3600):
+            logger.info("Sleeping for %s seconds ...", settings.timeout_seconds)
+            if shutdown_event.wait(timeout=settings.timeout_seconds):
                 break
 
     logger.info("Bot Stopped.")
