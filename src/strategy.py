@@ -94,6 +94,17 @@ class Strategist:
                 logger.info("Strategy: Attempting %s for %s...", model, ticker)
                 text = self._call_gemini(model, prompt)
                 data = json.loads(text)
+
+                # Robustness check: Handle list response (some models wrap single object in list)
+                if isinstance(data, list):
+                    if data and isinstance(data[0], dict):
+                        data = data[0]
+                    else:
+                        raise ValueError(f"Unexpected list response structure: {data}")
+
+                if not isinstance(data, dict):
+                    raise ValueError(f"Unexpected response type: {type(data)}")
+
                 return TradeSignal(**data)
             except (ClientError, ServerError) as e:
                 last_error = e

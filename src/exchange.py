@@ -19,6 +19,12 @@ class KrakenExchange:
             "enableRateLimit": True,
         })
         self._markets = None
+        # Load markets to ensure precision and limits are available
+        try:
+            self._client.load_markets()
+            self._markets = self._client.markets
+        except Exception:
+            logger.exception("Failed to load markets on initialization.")
 
     def symbol_exists(self, symbol: str) -> bool:
         """Check if the exchange supports this symbol."""
@@ -104,18 +110,22 @@ class KrakenExchange:
             msg = "Amount must be positive"
             raise ValueError(msg)
 
+        # Ensure precision
+        price_str = self._client.price_to_precision(symbol, price)
+        amount_str = self._client.amount_to_precision(symbol, amount)
+
         # Explicitly define params for Maker-only
         params = {"postOnly": True}
 
         # Log intent (in a real app, use logger)
-        logger.info("I: Placing MAKER BUY on %s: %s @ %s", symbol, amount, price)
+        logger.info("I: Placing MAKER BUY on %s: %s @ %s", symbol, amount_str, price_str)
 
         return self._client.create_order(
             symbol=symbol,
             type="limit",
             side="buy",
-            amount=amount,
-            price=price,
+            amount=amount_str,
+            price=price_str,
             params=params,
         )
 
@@ -137,15 +147,19 @@ class KrakenExchange:
             msg = "Amount must be positive"
             raise ValueError(msg)
 
+        # Ensure precision
+        price_str = self._client.price_to_precision(symbol, price)
+        amount_str = self._client.amount_to_precision(symbol, amount)
+
         params = {"postOnly": True}
-        logger.info("I: Placing STRATEGIC MAKER SELL on %s: %s @ %s", symbol, amount, price)
+        logger.info("I: Placing STRATEGIC MAKER SELL on %s: %s @ %s", symbol, amount_str, price_str)
 
         return self._client.create_order(
             symbol=symbol,
             type="limit",
             side="sell",
-            amount=amount,
-            price=price,
+            amount=amount_str,
+            price=price_str,
             params=params,
         )
 
@@ -159,8 +173,9 @@ class KrakenExchange:
     ) -> list[dict[str, Any]]:
         """Place Stop Loss and Take Profit orders.
 
-        NOTE: Ideally these should be linked to the entry order (OCO), but support varies.
-        For MVP, we place separate orders. CAUTION: One must be cancelled if other hits.
+        NOTE:Ideally these should be linked (OCO).
+        Currently for SPOT, we can only place ONE order locking the funds.
+        PRIORITY: STOP LOSS.
         
         Args:
             symbol: Ticker
@@ -172,31 +187,29 @@ class KrakenExchange:
         """
         orders = []
 
+        # Precision handling
+        sl_price_str = self._client.price_to_precision(symbol, sl_price)
+        amount_str = self._client.amount_to_precision(symbol, amount)
+        tp_price_str = self._client.price_to_precision(symbol, tp_price)
+
         # Stop Loss (Stop Market usually ensures exit, Stop Limit risks non-fill)
         # Using 'stop-loss' type (market sell when triggered)
-        logger.info("I: Placing STOP LOSS on %s: %s @ %s", symbol, amount, sl_price)
+        logger.info("I: Placing STOP LOSS on %s: %s @ %s", symbol, amount_str, sl_price_str)
+        # Fix for Kraken: Trigger price must be in params['price'] for stop-loss
         sl_order = self._client.create_order(
             symbol=symbol,
             type="stop-loss",
             side="sell",
-            amount=amount,
-            price=sl_price, # In stop-loss, 'price' is the trigger price usually?
-                            # Check ccxt specifics.
-                            # For Kraken 'stop-loss' type: 'price' is the stop price.
-            params={"stopPrice": sl_price}, # Redundant but safe for some exchanges
+            amount=amount_str,
+            price=None, # Must be None for Kraken stop-loss via CCXT
+            params={"price": sl_price_str}, # Trigger price here
         )
         orders.append(sl_order)
 
-        # Take Profit (Limit Sell)
-        logger.info("I: Placing TAKE PROFIT on %s: %s @ %s", symbol, amount, tp_price)
-        tp_order = self._client.create_order(
-            symbol=symbol,
-            type="limit", # Limit sell for TP
-            side="sell",
-            amount=amount,
-            price=tp_price,
-            params={"postOnly": True}, # Maker rebate on exit too!
+        # Take Profit - Skipped for now to avoid Insufficient Funds error on Spot
+        logger.warning(
+            "I: Skipping TAKE PROFIT %s on Exchange to avoid locking funds. Monitor via Bot.",
+            tp_price_str,
         )
-        orders.append(tp_order)
 
         return orders
