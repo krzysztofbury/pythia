@@ -1,7 +1,7 @@
 """Tests for fill reconciliation and P&L with fees."""
 
 import datetime
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 from pydantic import SecretStr
@@ -181,3 +181,101 @@ class TestFillSync:
         )
         assert pnl < 0
         assert tax == 0.0
+
+
+class TestReconcileFills:
+    def test_reconcile_records_missing_sl_fill(self, journal):
+        journal.log_trade(
+            account="Kraken",
+            instrument="BTC/USDC",
+            side="BUY",
+            price=70000.0,
+            quantity=0.001,
+            value=70.0,
+            currency="USDC",
+            reasoning="test buy",
+        )
+
+        mock_exchange = MagicMock()
+        mock_exchange.fetch_my_trades.return_value = [
+            {
+                "id": "TSL001",
+                "timestamp": 1712900000000,
+                "datetime": "2026-04-12T12:00:00.000Z",
+                "symbol": "BTC/USDC",
+                "side": "sell",
+                "price": 69000.0,
+                "amount": 0.001,
+                "cost": 69.0,
+                "fee": {"cost": 0.276, "currency": "USDC"},
+                "order": "OSL001",
+                "type": "market",
+            },
+        ]
+
+        from main import _reconcile_fills
+
+        mock_notifier = MagicMock()
+        _reconcile_fills(
+            tickers=["BTC/USDC"],
+            exchange=mock_exchange,
+            journal=journal,
+            notifier=mock_notifier,
+            quote_currency="USDC",
+            tax_rate=0.19,
+        )
+
+        assert journal.is_fill_recorded("TSL001")
+        row = journal._conn.execute(
+            "SELECT side, price, fee, fill_source FROM trades WHERE reasoning LIKE '%TSL001%'",
+        ).fetchone()
+        assert row[0] == "SELL"
+        assert row[1] == 69000.0
+        assert row[2] == pytest.approx(0.276)
+        assert row[3] == "exchange"
+
+    def test_reconcile_skips_already_recorded(self, journal):
+        journal.log_trade(
+            account="Kraken",
+            instrument="BTC/USDC",
+            side="SELL",
+            price=69000.0,
+            quantity=0.001,
+            value=69.0,
+            currency="USDC",
+            reasoning="SL fill [TEXIST1]",
+            fee=0.276,
+            fill_source="exchange",
+        )
+
+        mock_exchange = MagicMock()
+        mock_exchange.fetch_my_trades.return_value = [
+            {
+                "id": "TEXIST1",
+                "timestamp": 1712900000000,
+                "datetime": "2026-04-12T12:00:00.000Z",
+                "symbol": "BTC/USDC",
+                "side": "sell",
+                "price": 69000.0,
+                "amount": 0.001,
+                "cost": 69.0,
+                "fee": {"cost": 0.276, "currency": "USDC"},
+                "order": "O1",
+                "type": "market",
+            },
+        ]
+
+        from main import _reconcile_fills
+
+        mock_notifier = MagicMock()
+        _reconcile_fills(
+            tickers=["BTC/USDC"],
+            exchange=mock_exchange,
+            journal=journal,
+            notifier=mock_notifier,
+            quote_currency="USDC",
+            tax_rate=0.19,
+        )
+
+        count = journal._conn.execute("SELECT COUNT(*) FROM trades WHERE side='SELL'").fetchone()[0]
+        assert count == 1
