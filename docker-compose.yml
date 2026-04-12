@@ -1,30 +1,35 @@
 services:
+  warp-proxy:
+    image: ghcr.io/mon-ius/docker-warp-socks:v5
+    container_name: warp-proxy
+    restart: unless-stopped
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
+    environment:
+      - WARP_SLEEP=2
+
   oracle-pythia:
-    image: python:3.13-slim-bookworm
+    image: ghcr.io/astral-sh/uv:python3.13-bookworm-slim
     container_name: oracle-pythia
     restart: unless-stopped
     working_dir: /app
-    # Fix for QNAP DNS issues:
+    entrypoint: []
+    depends_on:
+      - warp-proxy
     dns:
       - 8.8.8.8
       - 1.1.1.1
     volumes:
-      - /share/homes/morb1/oracle-pythia-v3:/app
+      - ./logs:/app/logs
+      - ./.env:/app/.env:ro
     environment:
       - PYTHONPATH=/app/src
       - PYTHONUNBUFFERED=1
-      - KRAKEN_API_KEY=your_key
-      - KRAKEN_PRIVATE_KEY=your_secret
-      - GOOGLE_API_KEY=your_gemini_key
-      - XAI_API_KEY=your_grok_key
-      - XAI_MODEL=grok-4-fast-non-reasoning
-      - GEMINI_MODEL=gemini-3-flash-preview
-      - QUOTE_CURRENCY=USDC
-      - TRADING_MODE=PAPER
-      - MAX_POSITION_SIZE_USD=50.0
-      - TRADING_UNIVERSE=BTC/USDC,ETH/USDC,SOL/USDC,XRP/USDC,DOGE/USDC,SHIB/USDC,LINK/USDC
-      - TIMEOUT_SECONDS=3600
-    command: >
-      sh -c "pip install uv && 
-             uv sync --frozen --no-dev && 
-             uv run python src/main.py"
+      - WARP_PROXY=socks5h://warp-proxy:9091
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os,time; f='logs/healthcheck'; exit(0 if os.path.exists(f) and time.time()-os.path.getmtime(f)<3600 else 1)"]
+      interval: 5m
+      timeout: 10s
+      retries: 3
+      start_period: 2m

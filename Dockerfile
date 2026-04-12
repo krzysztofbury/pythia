@@ -12,7 +12,7 @@ COPY pyproject.toml uv.lock ./
 COPY src/ ./src/
 
 # Install dependencies using uv
-RUN uv sync --frozen --no-dev
+RUN uv sync --frozen --no-group dev
 
 # Create logs directory
 RUN mkdir -p /app/logs
