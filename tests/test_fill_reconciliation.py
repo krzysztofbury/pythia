@@ -58,6 +58,80 @@ class TestSchemaMigration:
         row = journal._conn.execute("SELECT fill_source FROM trades WHERE side='SELL'").fetchone()
         assert row[0] == "exchange"
 
+    def test_fee_defaults_to_zero(self, journal):
+        """Trades without explicit fee should default to 0.0."""
+        journal.log_trade(
+            account="Kraken",
+            instrument="BTC/USDC",
+            side="BUY",
+            price=70000.0,
+            quantity=0.001,
+            value=70.0,
+            currency="USDC",
+            reasoning="test",
+        )
+        row = journal._conn.execute("SELECT fee FROM trades ORDER BY id DESC LIMIT 1").fetchone()
+        assert row[0] == 0.0
+
+    def test_fill_source_defaults_to_bot(self, journal):
+        """Trades without explicit fill_source should default to 'bot'."""
+        journal.log_trade(
+            account="Kraken",
+            instrument="BTC/USDC",
+            side="BUY",
+            price=70000.0,
+            quantity=0.001,
+            value=70.0,
+            currency="USDC",
+            reasoning="test",
+        )
+        row = journal._conn.execute(
+            "SELECT fill_source FROM trades ORDER BY id DESC LIMIT 1",
+        ).fetchone()
+        assert row[0] == "bot"
+
+    def test_migration_adds_columns_to_existing_db(self, tmp_path):
+        """ALTER TABLE migration should add columns to a pre-existing DB without them."""
+        import sqlite3
+
+        db_path = str(tmp_path / "old.db")
+        # Create a DB with the OLD schema (no fee/fill_source)
+        conn = sqlite3.connect(db_path)
+        conn.execute("""
+            CREATE TABLE trades (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                date TEXT NOT NULL,
+                day_of_week TEXT NOT NULL,
+                account TEXT NOT NULL,
+                instrument TEXT NOT NULL,
+                side TEXT NOT NULL,
+                price REAL NOT NULL,
+                quantity REAL NOT NULL,
+                value REAL NOT NULL,
+                currency TEXT NOT NULL,
+                profit REAL NOT NULL DEFAULT 0.0,
+                tax REAL NOT NULL DEFAULT 0.0,
+                reasoning TEXT NOT NULL DEFAULT ''
+            )
+        """)
+        conn.execute(
+            "INSERT INTO trades (timestamp, date, day_of_week, account, instrument, side, price, quantity, value, currency, reasoning) "
+            "VALUES ('2026-01-01T00:00:00+00:00', '2026-01-01', 'Wednesday', 'Kraken', 'BTC/USDC', 'BUY', 70000, 0.001, 70, 'USDC', 'old trade')",
+        )
+        conn.commit()
+        conn.close()
+
+        # Now open with TradeJournal — migration should run
+        journal = TradeJournal(db_path=db_path)
+        cols = [r[1] for r in journal._conn.execute("PRAGMA table_info(trades)").fetchall()]
+        assert "fee" in cols
+        assert "fill_source" in cols
+        # Old data should have defaults
+        row = journal._conn.execute("SELECT fee, fill_source FROM trades").fetchone()
+        assert row[0] == 0.0
+        assert row[1] == "bot"
+
 
 class TestFetchMyTrades:
     def test_fetch_my_trades_returns_fills(self):
@@ -182,6 +256,88 @@ class TestFillSync:
         assert pnl < 0
         assert tax == 0.0
 
+    def test_compute_pnl_with_fees_dca_multiple_buys(self, journal):
+        """P&L with DCA: avg cost basis from multiple buys, proportional fees."""
+        # Buy 1: 0.001 BTC @ 70000, fee=0.175
+        journal.log_trade(
+            account="Kraken",
+            instrument="BTC/USDC",
+            side="BUY",
+            price=70000.0,
+            quantity=0.001,
+            value=70.0,
+            currency="USDC",
+            reasoning="first buy",
+            fee=0.175,
+        )
+        # Buy 2 (DCA): 0.001 BTC @ 68000, fee=0.170
+        journal.log_trade(
+            account="Kraken",
+            instrument="BTC/USDC",
+            side="BUY",
+            price=68000.0,
+            quantity=0.001,
+            value=68.0,
+            currency="USDC",
+            reasoning="DCA buy",
+            fee=0.170,
+        )
+        # Avg cost = (70000*0.001 + 68000*0.001) / 0.002 = 69000
+        # Total buy fees = 0.345, total buy qty = 0.002
+        # Sell 0.002 @ 71000, sell_fee=0.355
+        pnl, tax = journal.compute_pnl_with_fees(
+            ticker="BTC/USDC",
+            sell_price=71000.0,
+            sell_qty=0.002,
+            sell_fee=0.355,
+        )
+        # gross = (71000 - 69000) * 0.002 = 4.0
+        # proportional buy fee = 0.345 * (0.002/0.002) = 0.345
+        # profit = 4.0 - 0.345 - 0.355 = 3.3
+        assert pnl == pytest.approx(3.3, abs=0.01)
+        assert tax == pytest.approx(3.3 * 0.19, abs=0.01)
+
+    def test_compute_pnl_no_prior_buys(self, journal):
+        """Selling with no prior buy records should return zero profit."""
+        pnl, tax = journal.compute_pnl_with_fees(
+            ticker="UNKNOWN/USDC",
+            sell_price=100.0,
+            sell_qty=1.0,
+            sell_fee=0.25,
+        )
+        # avg_cost = sell_price (fallback), gross = 0, profit = -0.25
+        assert pnl == pytest.approx(-0.25, abs=0.01)
+        assert tax == 0.0
+
+    def test_get_last_sync_timestamp_ignores_other_tickers(self, journal):
+        """Timestamp should only reflect trades for the requested ticker."""
+        journal.log_trade(
+            account="Kraken",
+            instrument="ETH/USDC",
+            side="BUY",
+            price=2000.0,
+            quantity=0.01,
+            value=20.0,
+            currency="USDC",
+            reasoning="eth buy",
+        )
+        # BTC should still have no timestamp
+        assert journal.get_last_sync_timestamp("BTC/USDC") is None
+
+    def test_is_fill_recorded_partial_match_rejected(self, journal):
+        """Substring matches that aren't bracketed should not count."""
+        journal.log_trade(
+            account="Kraken",
+            instrument="BTC/USDC",
+            side="BUY",
+            price=70000.0,
+            quantity=0.001,
+            value=70.0,
+            currency="USDC",
+            reasoning="Some reasoning with TXYZ in it but no brackets",
+        )
+        assert journal.is_fill_recorded("TXYZ") is False
+
 
 class TestReconcileFills:
     def test_reconcile_records_missing_sl_fill(self, journal):
@@ -279,3 +435,215 @@ class TestReconcileFills:
 
         count = journal._conn.execute("SELECT COUNT(*) FROM trades WHERE side='SELL'").fetchone()[0]
         assert count == 1
+
+    def test_reconcile_records_buy_fill(self, journal):
+        """A Kraken BUY fill not in our journal gets recorded (zero P&L)."""
+        mock_exchange = MagicMock()
+        mock_exchange.fetch_my_trades.return_value = [
+            {
+                "id": "TBUY01",
+                "timestamp": 1712900000000,
+                "symbol": "ETH/USDC",
+                "side": "buy",
+                "price": 2000.0,
+                "amount": 0.01,
+                "cost": 20.0,
+                "fee": {"cost": 0.05, "currency": "USDC"},
+            },
+        ]
+
+        from main import _reconcile_fills
+
+        mock_notifier = MagicMock()
+        _reconcile_fills(
+            tickers=["ETH/USDC"],
+            exchange=mock_exchange,
+            journal=journal,
+            notifier=mock_notifier,
+            quote_currency="USDC",
+            tax_rate=0.19,
+        )
+
+        assert journal.is_fill_recorded("TBUY01")
+        row = journal._conn.execute(
+            "SELECT side, profit, fee, fill_source FROM trades WHERE reasoning LIKE '%TBUY01%'",
+        ).fetchone()
+        assert row[0] == "BUY"
+        assert row[1] == 0.0  # BUY fills have no P&L
+        assert row[2] == pytest.approx(0.05)
+        assert row[3] == "exchange"
+
+    def test_reconcile_handles_exchange_error(self, journal):
+        """Exchange errors during reconciliation should not crash."""
+        mock_exchange = MagicMock()
+        mock_exchange.fetch_my_trades.side_effect = Exception("Connection timeout")
+
+        from main import _reconcile_fills
+
+        mock_notifier = MagicMock()
+        # Should not raise
+        _reconcile_fills(
+            tickers=["BTC/USDC"],
+            exchange=mock_exchange,
+            journal=journal,
+            notifier=mock_notifier,
+            quote_currency="USDC",
+            tax_rate=0.19,
+        )
+
+    def test_reconcile_skips_invalid_fills(self, journal):
+        """Fills with zero price or missing side should be ignored."""
+        mock_exchange = MagicMock()
+        mock_exchange.fetch_my_trades.return_value = [
+            {"id": "BAD1", "side": "", "price": 0, "amount": 1, "cost": 0, "fee": {}},
+            {"id": "BAD2", "side": "sell", "price": 0, "amount": 1, "cost": 0, "fee": {}},
+            {"id": "", "side": "sell", "price": 100, "amount": 1, "cost": 100, "fee": {}},
+        ]
+
+        from main import _reconcile_fills
+
+        _reconcile_fills(
+            tickers=["BTC/USDC"],
+            exchange=mock_exchange,
+            journal=journal,
+            notifier=MagicMock(),
+            quote_currency="USDC",
+            tax_rate=0.19,
+        )
+        count = journal._conn.execute("SELECT COUNT(*) FROM trades").fetchone()[0]
+        assert count == 0
+
+    def test_reconcile_sell_deletes_position_state(self, journal):
+        """A reconciled SELL fill should delete position_state for that ticker."""
+        from models import PositionState, StopMode
+
+        # Set up position state
+        state = PositionState(
+            ticker="BTC/USDC",
+            entry_price=70000.0,
+            high_watermark=71000.0,
+            stop_mode=StopMode.TRAILING,
+            current_sl=69000.0,
+            current_tp=73000.0,
+        )
+        journal.upsert_position_state(state)
+        assert journal.get_position_state("BTC/USDC") is not None
+
+        # Record a BUY so P&L calc works
+        journal.log_trade(
+            account="Kraken",
+            instrument="BTC/USDC",
+            side="BUY",
+            price=70000.0,
+            quantity=0.001,
+            value=70.0,
+            currency="USDC",
+            reasoning="test buy",
+        )
+
+        mock_exchange = MagicMock()
+        mock_exchange.fetch_my_trades.return_value = [
+            {
+                "id": "TSL099",
+                "side": "sell",
+                "price": 69000.0,
+                "amount": 0.001,
+                "cost": 69.0,
+                "fee": {"cost": 0.17, "currency": "USDC"},
+            },
+        ]
+
+        from main import _reconcile_fills
+
+        _reconcile_fills(
+            tickers=["BTC/USDC"],
+            exchange=mock_exchange,
+            journal=journal,
+            notifier=MagicMock(),
+            quote_currency="USDC",
+            tax_rate=0.19,
+        )
+        assert journal.get_position_state("BTC/USDC") is None
+
+    def test_reconcile_sell_sends_notification(self, journal):
+        """A reconciled SELL fill should trigger a trade notification."""
+        journal.log_trade(
+            account="Kraken",
+            instrument="BTC/USDC",
+            side="BUY",
+            price=70000.0,
+            quantity=0.001,
+            value=70.0,
+            currency="USDC",
+            reasoning="buy",
+        )
+        mock_exchange = MagicMock()
+        mock_exchange.fetch_my_trades.return_value = [
+            {
+                "id": "TSL100",
+                "side": "sell",
+                "price": 69500.0,
+                "amount": 0.001,
+                "cost": 69.5,
+                "fee": {"cost": 0.17, "currency": "USDC"},
+            },
+        ]
+        from main import _reconcile_fills
+
+        mock_notifier = MagicMock()
+        _reconcile_fills(
+            tickers=["BTC/USDC"],
+            exchange=mock_exchange,
+            journal=journal,
+            notifier=mock_notifier,
+            quote_currency="USDC",
+            tax_rate=0.19,
+        )
+        mock_notifier.notify_trade.assert_called_once()
+        call_args = mock_notifier.notify_trade.call_args
+        assert call_args[0][0] == "BTC/USDC"
+        assert call_args[0][1] == "SELL"
+
+    def test_reconcile_multiple_fills_in_one_call(self, journal):
+        """Multiple fills from one fetch should all be processed."""
+        journal.log_trade(
+            account="Kraken",
+            instrument="LINK/USDC",
+            side="BUY",
+            price=9.0,
+            quantity=2.0,
+            value=18.0,
+            currency="USDC",
+            reasoning="buy",
+        )
+        mock_exchange = MagicMock()
+        mock_exchange.fetch_my_trades.return_value = [
+            {
+                "id": "T1",
+                "side": "sell",
+                "price": 8.5,
+                "amount": 1.0,
+                "cost": 8.5,
+                "fee": {"cost": 0.02},
+            },
+            {
+                "id": "T2",
+                "side": "buy",
+                "price": 8.3,
+                "amount": 1.5,
+                "cost": 12.45,
+                "fee": {"cost": 0.03},
+            },
+        ]
+        from main import _reconcile_fills
+
+        _reconcile_fills(
+            tickers=["LINK/USDC"],
+            exchange=mock_exchange,
+            journal=journal,
+            notifier=MagicMock(),
+            quote_currency="USDC",
+            tax_rate=0.19,
+        )
+        assert journal.is_fill_recorded("T1")
+        assert journal.is_fill_recorded("T2")

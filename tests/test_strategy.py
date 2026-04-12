@@ -1,5 +1,7 @@
 """Tests for the algorithmic strategy engine."""
 
+import pytest
+
 from indicators import IndicatorSnapshot
 from models import MarketData, TradeSignal
 from strategy import Strategist
@@ -341,6 +343,117 @@ class TestStrategist:
         signal = self.strategist.generate_signal(data)
         assert "mean-reversion" not in signal.reasoning
 
+    def test_trending_down_still_allows_exit(self):
+        """TRENDING_DOWN should NOT block SELL on owned positions."""
+        from models import MarketRegime
+
+        data = _make_data(
+            sentiment="BEARISH: Market crash.",
+            consensus="DOWN, 75%, Bearish.",
+            has_position=True,
+            entry_price=45000.0,
+            pnl_pct=-5.0,
+            indicators=IndicatorSnapshot(
+                rsi=25.0,
+                macd_histogram=-0.1,
+                bb_pct_b=0.05,
+                atr_pct=4.0,
+                adx=40.0,
+                roc=-3.0,
+                obv_slope=-0.5,
+            ),
+            regime=MarketRegime.TRENDING_DOWN,
+        )
+        signal = self.strategist.generate_signal(data)
+        # Should produce SELL or HOLD for exit evaluation, NOT be blocked
+        assert signal.action in ("SELL", "HOLD")
+        # Critically: should NOT say "Blocked: TRENDING_DOWN"
+        assert "Blocked: TRENDING_DOWN" not in signal.reasoning
+
+    def test_trending_down_blocks_even_strong_signals(self):
+        """Even very strong bullish signals should be blocked in TRENDING_DOWN."""
+        from forecast import PriceForecast
+        from models import MarketRegime
+        from volatility import VolatilityForecast, VolatilityRegime
+
+        data = _make_data(
+            sentiment="BULLISH: Score: 9/10. Massive inflows.",
+            consensus="UP, 85%, Overwhelming bullish.",
+            fear_greed="15 (Extreme Fear)",
+            indicators=IndicatorSnapshot(
+                rsi=22.0,
+                macd_histogram=0.2,
+                bb_pct_b=0.05,
+                atr_pct=3.0,
+                adx=35.0,
+                roc=-2.0,
+                obv_slope=0.3,
+            ),
+            volatility=VolatilityForecast(
+                current_vol_pct=50.0,
+                forecast_vol_pct=55.0,
+                regime=VolatilityRegime.NORMAL,
+                method="GARCH",
+            ),
+            forecast=PriceForecast(
+                current_price=44000.0,
+                forecast_price=46000.0,
+                lower_bound=43000.0,
+                upper_bound=47000.0,
+                direction="UP",
+                change_pct=4.5,
+                method="ARIMA",
+            ),
+            polymarket_odds='Polymarket: "Will BTC rise?" -> YES: 80%',
+            regime=MarketRegime.TRENDING_DOWN,
+        )
+        signal = self.strategist.generate_signal(data)
+        assert signal.action == "HOLD"
+        assert "TRENDING_DOWN" in signal.reasoning
+
+    def test_mean_reversion_fires_in_ranging(self):
+        """Mean reversion bonus SHOULD fire in RANGING with oversold conditions."""
+        from models import MarketRegime
+
+        data = _make_data(
+            sentiment="BULLISH: Moderate outlook.",
+            consensus="UP, 62%, Slight bullish.",
+            indicators=IndicatorSnapshot(
+                rsi=25.0,
+                macd_histogram=0.01,
+                bb_pct_b=0.10,
+                atr_pct=2.5,
+                adx=18.0,
+                obv_slope=0.1,
+            ),
+            regime=MarketRegime.RANGING,
+        )
+        signal = self.strategist.generate_signal(data)
+        assert "mean-reversion" in signal.reasoning
+
+    def test_mean_reversion_blocked_in_trending_up(self):
+        """Mean reversion bonus should NOT fire in TRENDING_UP."""
+        from models import MarketRegime
+
+        data = _make_data(
+            sentiment="BULLISH: Strong trend.",
+            consensus="UP, 70%, Bullish.",
+            has_position=True,
+            entry_price=43000.0,
+            indicators=IndicatorSnapshot(
+                rsi=25.0,
+                macd_histogram=0.05,
+                bb_pct_b=0.10,
+                atr_pct=2.5,
+                adx=18.0,
+                roc=1.5,
+                obv_slope=0.2,
+            ),
+            regime=MarketRegime.TRENDING_UP,
+        )
+        signal = self.strategist.generate_signal(data)
+        assert "mean-reversion" not in signal.reasoning
+
 
 # ---------------------------------------------------------------------------
 # Regime-aware and multi-timeframe tests
@@ -393,6 +506,37 @@ class TestRegimeModifier:
         result, reason = _apply_regime_modifier(composite, None)
         assert result == composite
         assert reason is None
+
+
+class TestRegimeModifierV82:
+    """Tests for the v8.2 TRENDING_DOWN modifier fix."""
+
+    def test_trending_down_dampens_positive_composite(self):
+        """Positive composite in TRENDING_DOWN should be dampened by 0.80."""
+        from models import MarketRegime
+        from strategy import _apply_regime_modifier
+
+        result, reason = _apply_regime_modifier(0.50, MarketRegime.TRENDING_DOWN)
+        assert result == pytest.approx(0.40)
+        assert "x0.80" in reason
+
+    def test_trending_down_amplifies_negative_composite(self):
+        """Negative composite in TRENDING_DOWN should be amplified by 1.20."""
+        from models import MarketRegime
+        from strategy import _apply_regime_modifier
+
+        result, reason = _apply_regime_modifier(-0.50, MarketRegime.TRENDING_DOWN)
+        assert result == pytest.approx(-0.60)
+        assert "x1.20" in reason
+
+    def test_trending_down_zero_composite_noop(self):
+        """Zero composite in TRENDING_DOWN should be no-op."""
+        from models import MarketRegime
+        from strategy import _apply_regime_modifier
+
+        result, reason = _apply_regime_modifier(0.0, MarketRegime.TRENDING_DOWN)
+        assert result == 0.0
+        assert "no-op" in reason
 
 
 class TestMtfAlignment:
@@ -717,6 +861,30 @@ class TestWeightChanges:
 
     def test_entry_threshold(self):
         """Entry threshold should be 0.25 (was 0.15)."""
+        from strategy import _ENTRY_THRESHOLD
+
+        assert _ENTRY_THRESHOLD == 0.25  # noqa: PLR2004
+
+
+class TestConfigChanges:
+    """Verify config defaults match v8.2 requirements."""
+
+    def test_doge_not_in_default_universe(self):
+        """DOGE should not be in the default trading universe."""
+        from config import Settings
+
+        default = Settings.model_fields["trading_universe"].default
+        assert "DOGE" not in default
+
+    def test_max_entries_per_cycle_default(self):
+        """max_entries_per_cycle should default to 2."""
+        from config import Settings
+
+        default = Settings.model_fields["max_entries_per_cycle"].default
+        assert default == 2  # noqa: PLR2004
+
+    def test_entry_threshold_is_025(self):
+        """Entry threshold should be 0.25."""
         from strategy import _ENTRY_THRESHOLD
 
         assert _ENTRY_THRESHOLD == 0.25  # noqa: PLR2004
