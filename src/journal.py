@@ -147,6 +147,7 @@ class TradeJournal:
         assert price > 0, f"Trade price must be positive, got {price}"  # noqa: S101
         assert quantity > 0, f"Trade quantity must be positive, got {quantity}"  # noqa: S101
         assert side in ("BUY", "SELL", "CANCEL"), f"Unknown trade side: {side!r}"  # noqa: S101
+        assert fill_source in ("bot", "exchange"), f"Unknown fill_source: {fill_source!r}"  # noqa: S101
 
         now = datetime.datetime.now(tz=datetime.timezone.utc)
         days = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
@@ -300,39 +301,88 @@ class TradeJournal:
             ).fetchone()
         return row is not None
 
+    def has_recent_trade(
+        self,
+        ticker: str,
+        side: str,
+        quantity: float,
+        window_minutes: int = 15,
+    ) -> bool:
+        """Check if a similar trade was recorded recently (to avoid duplicates).
+
+        Matches by ticker + side + quantity within +/-5% + time window.
+        """
+        cutoff = (
+            datetime.datetime.now(tz=datetime.timezone.utc)
+            - datetime.timedelta(minutes=window_minutes)
+        ).isoformat()
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT quantity FROM trades WHERE instrument = ? AND side = ? AND timestamp > ?",
+                (ticker, side, cutoff),
+            ).fetchall()
+        for (qty,) in rows:
+            if abs(qty - quantity) / max(quantity, 1e-12) < 0.05:  # within 5%  # noqa: PLR2004
+                return True
+        return False
+
     def compute_pnl_with_fees(
         self,
         ticker: str,
         sell_price: float,
         sell_qty: float,
         sell_fee: float,
+        tax_rate: float = 0.19,
     ) -> tuple[float, float]:
         """Calculate realized P&L including buy and sell fees.
-        Returns (profit_after_fees, tax). Tax rate = 0.19.
+        Returns (profit_after_fees, tax).
         """
-        avg_cost = self.get_average_cost_basis(ticker)
-        if avg_cost is None:
-            avg_cost = sell_price
-
         with self._lock:
-            row = self._conn.execute(
+            # Fetch all data in a single lock acquisition to prevent race conditions.
+            rows = self._conn.execute(
+                "SELECT side, price, quantity FROM trades WHERE instrument = ? ORDER BY id ASC",
+                (ticker,),
+            ).fetchall()
+
+            fee_row = self._conn.execute(
                 "SELECT COALESCE(SUM(fee), 0.0) FROM trades WHERE instrument = ? AND side = 'BUY'",
                 (ticker,),
             ).fetchone()
-        total_buy_fees = float(row[0]) if row else 0.0
 
-        with self._lock:
             qty_row = self._conn.execute(
                 "SELECT COALESCE(SUM(quantity), 0.0) FROM trades "
                 "WHERE instrument = ? AND side = 'BUY'",
                 (ticker,),
             ).fetchone()
+
+        # Compute average cost basis from fetched rows (same logic as get_average_cost_basis).
+        avg_cost: float | None = None
+        if rows:
+            total_qty = 0.0
+            total_cost = 0.0
+            for side, price, qty in rows:
+                if side == "BUY":
+                    total_cost += price * qty
+                    total_qty += qty
+                elif side in ("SELL", "CANCEL"):
+                    if total_qty > 0:
+                        average_cost = total_cost / total_qty
+                        sold_qty = min(qty, total_qty)
+                        total_cost -= average_cost * sold_qty
+                        total_qty -= sold_qty
+            if total_qty > 0:
+                avg_cost = total_cost / total_qty
+
+        if avg_cost is None:
+            avg_cost = sell_price
+
+        total_buy_fees = float(fee_row[0]) if fee_row else 0.0
         total_buy_qty = float(qty_row[0]) if qty_row else 1.0
 
         proportional_buy_fee = total_buy_fees * (sell_qty / max(total_buy_qty, 1e-12))
         gross_profit = (sell_price - avg_cost) * sell_qty
         profit = gross_profit - proportional_buy_fee - sell_fee
-        tax = profit * 0.19 if profit > 0 else 0.0
+        tax = profit * tax_rate if profit > 0 else 0.0
         return profit, tax
 
     def get_position_open_time(self, ticker: str) -> datetime.datetime | None:

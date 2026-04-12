@@ -814,6 +814,9 @@ def _execute_partial_sell(  # noqa: PLR0913
         if paper_portfolio:
             paper_portfolio.record_sell(ticker, sell_amount)
 
+    fee = sell_price * sell_amount * 0.0025
+    profit, tax = journal.compute_pnl_with_fees(ticker, sell_price, sell_amount, fee)
+
     journal.log_trade(
         account="Kraken",
         instrument=ticker,
@@ -823,6 +826,9 @@ def _execute_partial_sell(  # noqa: PLR0913
         value=sell_price * sell_amount,
         currency=settings.quote_currency,
         reasoning=reasoning,
+        profit=profit,
+        tax=tax,
+        fee=fee,
     )
     notifier.notify_trade(ticker, "PARTIAL SELL", sell_price, sell_amount, reasoning)
     return True
@@ -1011,6 +1017,7 @@ def _execute_dca(  # noqa: PLR0913
         value=limit_price * amount,
         currency=settings.quote_currency,
         reasoning=f"DCA: {trade_signal.reasoning}",
+        fee=limit_price * amount * 0.0025,
     )
     notifier.notify_trade(
         ticker,
@@ -1358,6 +1365,7 @@ def _evaluate_entry(  # noqa: PLR0913
         value=limit_price * amount,
         currency=settings.quote_currency,
         reasoning=trade_signal.reasoning,
+        fee=limit_price * amount * 0.0025,
     )
     notifier.notify_trade(
         ticker,
@@ -1471,8 +1479,13 @@ def _reconcile_fills(
                     continue
 
                 side = fill.get("side", "").upper()
-                fill_price = float(fill.get("price", 0))
                 fill_qty = float(fill.get("amount", 0))
+
+                # Check for recently recorded trades to avoid duplicating bot-placed orders
+                if journal.has_recent_trade(ticker, side, fill_qty):
+                    continue
+
+                fill_price = float(fill.get("price", 0))
                 fill_cost = float(fill.get("cost", 0))
                 fee_info = fill.get("fee", {})
                 fill_fee = float(fee_info.get("cost", 0)) if fee_info else 0.0
