@@ -300,6 +300,25 @@ class TestStrategist:
         assert signal.action == "HOLD"
         assert "TRENDING_DOWN" in signal.reasoning
 
+    def test_low_composite_does_not_buy(self):
+        """Composite below effective entry threshold should NOT trigger a BUY."""
+        from models import MarketRegime
+
+        data = _make_data(
+            sentiment="BULLISH: Moderate inflows.",
+            consensus="UP, 55%, Slight bullish.",
+            indicators=IndicatorSnapshot(
+                rsi=50.0,
+                macd_histogram=0.001,
+                bb_pct_b=0.50,
+                atr_pct=2.0,
+            ),
+            regime=MarketRegime.RANGING,
+        )
+        signal = self.strategist.generate_signal(data)
+        if signal.composite < 0.25:
+            assert signal.action == "HOLD"
+
 
 # ---------------------------------------------------------------------------
 # Regime-aware and multi-timeframe tests
@@ -673,7 +692,7 @@ class TestWeightChanges:
         assert W_TECHNICAL == 0.35  # noqa: PLR2004
 
     def test_entry_threshold(self):
-        """Entry threshold should be 0.15 (was 0.10)."""
+        """Entry threshold should be 0.25 (was 0.15)."""
         from strategy import _ENTRY_THRESHOLD
 
-        assert _ENTRY_THRESHOLD == 0.15  # noqa: PLR2004
+        assert _ENTRY_THRESHOLD == 0.25  # noqa: PLR2004

@@ -63,7 +63,7 @@ _WEIGHT_SUM = (
 assert abs(_WEIGHT_SUM - 1.0) < 1e-9, f"Weights must sum to 1.0, got {_WEIGHT_SUM}"  # noqa: S101, PLR2004
 
 # Entry / exit thresholds (asymmetric — drops are faster than rallies)
-_ENTRY_THRESHOLD = 0.15  # Was 0.10 — too much noise, stale exits killed P&L
+_ENTRY_THRESHOLD = 0.25  # Was 0.15 — still too many low-conviction entries becoming stale exits
 _EXIT_THRESHOLD = -0.05
 _STRONG_SELL_THRESHOLD = -0.25
 _DCA_THRESHOLD = 0.25
