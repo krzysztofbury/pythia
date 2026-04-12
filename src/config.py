@@ -48,13 +48,16 @@ class Settings(BaseSettings):
     healthcheck_file: str = "logs/healthcheck"
 
     # Trading Universe (Comma separated in .env)
-    trading_universe: str = "BTC/USDT,ETH/USDT,SOL/USDT,XRP/USDT,DOGE/USDT,SHIB/USDT,LINK/USDT"
+    trading_universe: str = "BTC/USDT,ETH/USDT,SOL/USDT,XRP/USDT,SHIB/USDT,LINK/USDT"
 
     # Bot Loop settings
     timeout_seconds: int = 3600  # Default 1 hour
 
     # DCA (Dollar Cost Averaging)
     max_dca_per_position: int = 1  # Max additional buys per owned position
+
+    # Entry pacing
+    max_entries_per_cycle: int = 2  # Max new positions per 15-min cycle
 
     # Stale Order Reconciliation
     stale_order_max_age_seconds: int = 7200  # 2 hours

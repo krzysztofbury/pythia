@@ -1795,7 +1795,15 @@ def run_cycle(  # noqa: PLR0913
 
     # Pass 2: Entry evaluation on available positions.
     if daily_loss_ok:
+        entries_this_cycle = 0
         for ticker in available_tickers:
+            if entries_this_cycle >= settings.max_entries_per_cycle:
+                logger.info(
+                    "Entry limit reached (%d/%d). Skipping remaining tickers.",
+                    entries_this_cycle,
+                    settings.max_entries_per_cycle,
+                )
+                break
             data = all_data.get(ticker)
             if not data:
                 continue
@@ -1814,6 +1822,7 @@ def run_cycle(  # noqa: PLR0913
                     paper_portfolio,
                 )
                 if bought:
+                    entries_this_cycle += 1
                     available_slots = max(available_slots - 1, 1)
                     owned_tickers.append(ticker)
             except Exception as exc:  # noqa: BLE001
