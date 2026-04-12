@@ -31,7 +31,8 @@ CREATE TABLE IF NOT EXISTS trades (
     tax         REAL    NOT NULL DEFAULT 0.0,
     reasoning   TEXT    NOT NULL DEFAULT '',
     fee         REAL    NOT NULL DEFAULT 0.0,
-    fill_source TEXT    NOT NULL DEFAULT 'bot'
+    fill_source TEXT    NOT NULL DEFAULT 'bot',
+    exchange_fill_id TEXT DEFAULT NULL
 );
 """
 
@@ -121,11 +122,18 @@ class TradeJournal:
                     "fill_source",
                     "ALTER TABLE trades ADD COLUMN fill_source TEXT NOT NULL DEFAULT 'bot'",
                 ),
+                (
+                    "exchange_fill_id",
+                    "ALTER TABLE trades ADD COLUMN exchange_fill_id TEXT DEFAULT NULL",
+                ),
             ]:
                 try:
                     self._conn.execute(ddl)
                 except sqlite3.OperationalError:
                     pass  # column already exists
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_exchange_fill_id ON trades(exchange_fill_id)",
+            )
             self._conn.commit()
 
     def log_trade(  # noqa: PLR0913
@@ -142,6 +150,7 @@ class TradeJournal:
         tax: float = 0.0,
         fee: float = 0.0,
         fill_source: str = "bot",
+        exchange_fill_id: str | None = None,
     ) -> None:
         """Insert a new trade record."""
         assert price > 0, f"Trade price must be positive, got {price}"  # noqa: S101
@@ -160,8 +169,8 @@ class TradeJournal:
                 "INSERT INTO trades "
                 "(timestamp, date, day_of_week, account, instrument, side, "
                 " price, quantity, value, currency, profit, tax, reasoning, "
-                " fee, fill_source) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                " fee, fill_source, exchange_fill_id) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     ts_str,
                     date_str,
@@ -178,6 +187,7 @@ class TradeJournal:
                     reasoning,
                     fee,
                     fill_source,
+                    exchange_fill_id,
                 ),
             )
             self._conn.commit()
@@ -291,13 +301,11 @@ class TradeJournal:
         return int(dt.timestamp() * 1000)
 
     def is_fill_recorded(self, exchange_trade_id: str) -> bool:
-        """Check if a Kraken fill ID is already in our journal.
-        We embed the exchange trade ID in the reasoning field as [ID].
-        """
+        """Check if a Kraken fill ID is already in our journal."""
         with self._lock:
             row = self._conn.execute(
-                "SELECT 1 FROM trades WHERE reasoning LIKE ?",
-                (f"%[{exchange_trade_id}]%",),
+                "SELECT 1 FROM trades WHERE exchange_fill_id = ?",
+                (exchange_trade_id,),
             ).fetchone()
         return row is not None
 

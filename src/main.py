@@ -1457,6 +1457,87 @@ def _reconcile_stale_orders(
             )
 
 
+def _process_single_fill(
+    fill: dict,
+    ticker: str,
+    journal: TradeJournal,
+    notifier: WebhookNotifier | NullNotifier,
+    quote_currency: str,
+    tax_rate: float,
+) -> None:
+    """Process a single Kraken fill and record it if not already tracked."""
+    fill_id = fill.get("id", "")
+    if not fill_id or journal.is_fill_recorded(fill_id):
+        return
+
+    side = fill.get("side", "").upper()
+    fill_price = float(fill.get("price", 0))
+    fill_qty = float(fill.get("amount", 0))
+    fill_cost = float(fill.get("cost", 0))
+    fee_info = fill.get("fee", {})
+    fill_fee = float(fee_info.get("cost", 0)) if fee_info else 0.0
+
+    if side not in ("BUY", "SELL") or fill_price <= 0:
+        return
+
+    # Check for recently recorded trades to avoid duplicating bot-placed orders
+    if journal.has_recent_trade(ticker, side, fill_qty):
+        return
+
+    profit = 0.0
+    tax = 0.0
+    if side == "SELL":
+        profit, tax = journal.compute_pnl_with_fees(
+            ticker,
+            fill_price,
+            fill_qty,
+            fill_fee,
+            tax_rate=tax_rate,
+        )
+
+    reasoning = (
+        f"Exchange fill: {side} detected via reconciliation. "
+        f"Price={fill_price}, Fee={fill_fee:.6f} [{fill_id}]"
+    )
+
+    journal.log_trade(
+        account="Kraken",
+        instrument=ticker,
+        side=side,
+        price=fill_price,
+        quantity=fill_qty,
+        value=fill_cost,
+        currency=quote_currency,
+        reasoning=reasoning,
+        profit=profit,
+        tax=tax,
+        fee=fill_fee,
+        fill_source="exchange",
+        exchange_fill_id=fill_id,
+    )
+
+    logger.info(
+        "Reconciliation: Recorded %s fill for %s: %.8f @ %s (fee: %.6f, P&L: %.4f) [%s]",
+        side,
+        ticker,
+        fill_qty,
+        fmt_price(fill_price),
+        fill_fee,
+        profit,
+        fill_id,
+    )
+
+    if side == "SELL":
+        journal.delete_position_state(ticker)
+        notifier.notify_trade(
+            ticker,
+            "SELL",
+            fill_price,
+            fill_qty,
+            f"Exchange SL/TP fill detected [{fill_id}]",
+        )
+
+
 def _reconcile_fills(
     tickers: list[str],
     exchange: KrakenExchange,
@@ -1474,76 +1555,14 @@ def _reconcile_fills(
 
             fills = exchange.fetch_my_trades(ticker, since_ms=since_ms)
             for fill in fills:
-                fill_id = fill.get("id", "")
-                if not fill_id or journal.is_fill_recorded(fill_id):
-                    continue
-
-                side = fill.get("side", "").upper()
-                fill_qty = float(fill.get("amount", 0))
-
-                # Check for recently recorded trades to avoid duplicating bot-placed orders
-                if journal.has_recent_trade(ticker, side, fill_qty):
-                    continue
-
-                fill_price = float(fill.get("price", 0))
-                fill_cost = float(fill.get("cost", 0))
-                fee_info = fill.get("fee", {})
-                fill_fee = float(fee_info.get("cost", 0)) if fee_info else 0.0
-
-                if side not in ("BUY", "SELL") or fill_price <= 0:
-                    continue
-
-                profit = 0.0
-                tax = 0.0
-                if side == "SELL":
-                    profit, tax = journal.compute_pnl_with_fees(
-                        ticker,
-                        fill_price,
-                        fill_qty,
-                        fill_fee,
-                    )
-
-                reasoning = (
-                    f"Exchange fill: {side} detected via reconciliation. "
-                    f"Price={fill_price}, Fee={fill_fee:.6f} [{fill_id}]"
-                )
-
-                journal.log_trade(
-                    account="Kraken",
-                    instrument=ticker,
-                    side=side,
-                    price=fill_price,
-                    quantity=fill_qty,
-                    value=fill_cost,
-                    currency=quote_currency,
-                    reasoning=reasoning,
-                    profit=profit,
-                    tax=tax,
-                    fee=fill_fee,
-                    fill_source="exchange",
-                )
-
-                logger.info(
-                    "Reconciliation: Recorded %s fill for %s: %.8f @ %s (fee: %.6f, P&L: %.4f) [%s]",
-                    side,
+                _process_single_fill(
+                    fill,
                     ticker,
-                    fill_qty,
-                    fmt_price(fill_price),
-                    fill_fee,
-                    profit,
-                    fill_id,
+                    journal,
+                    notifier,
+                    quote_currency,
+                    tax_rate,
                 )
-
-                if side == "SELL":
-                    journal.delete_position_state(ticker)
-                    notifier.notify_trade(
-                        ticker,
-                        "SELL",
-                        fill_price,
-                        fill_qty,
-                        f"Exchange SL/TP fill detected [{fill_id}]",
-                    )
-
         except Exception as exc:  # noqa: BLE001
             logger.warning("Fill reconciliation error for %s: %s", ticker, exc)
 

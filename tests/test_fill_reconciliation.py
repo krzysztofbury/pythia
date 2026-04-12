@@ -27,6 +27,11 @@ class TestSchemaMigration:
         col_names = [r[1] for r in row]
         assert "fill_source" in col_names
 
+    def test_trades_table_has_exchange_fill_id_column(self, journal):
+        row = journal._conn.execute("PRAGMA table_info(trades)").fetchall()
+        col_names = [r[1] for r in row]
+        assert "exchange_fill_id" in col_names
+
     def test_log_trade_accepts_fee(self, journal):
         journal.log_trade(
             account="Kraken",
@@ -127,10 +132,14 @@ class TestSchemaMigration:
         cols = [r[1] for r in journal._conn.execute("PRAGMA table_info(trades)").fetchall()]
         assert "fee" in cols
         assert "fill_source" in cols
+        assert "exchange_fill_id" in cols
         # Old data should have defaults
-        row = journal._conn.execute("SELECT fee, fill_source FROM trades").fetchone()
+        row = journal._conn.execute(
+            "SELECT fee, fill_source, exchange_fill_id FROM trades"
+        ).fetchone()
         assert row[0] == 0.0
         assert row[1] == "bot"
+        assert row[2] is None
 
 
 class TestFetchMyTrades:
@@ -211,6 +220,7 @@ class TestFillSync:
             reasoning="SL fill [TXYZ123]",
             fee=0.18,
             fill_source="exchange",
+            exchange_fill_id="TXYZ123",
         )
         assert journal.is_fill_recorded("TXYZ123") is True
 
@@ -324,8 +334,8 @@ class TestFillSync:
         # BTC should still have no timestamp
         assert journal.get_last_sync_timestamp("BTC/USDC") is None
 
-    def test_is_fill_recorded_partial_match_rejected(self, journal):
-        """Substring matches that aren't bracketed should not count."""
+    def test_is_fill_recorded_different_id_returns_false(self, journal):
+        """A different exchange_fill_id should not match."""
         journal.log_trade(
             account="Kraken",
             instrument="BTC/USDC",
@@ -334,9 +344,10 @@ class TestFillSync:
             quantity=0.001,
             value=70.0,
             currency="USDC",
-            reasoning="Some reasoning with TXYZ in it but no brackets",
+            reasoning="Some reasoning",
+            exchange_fill_id="TXYZ123",
         )
-        assert journal.is_fill_recorded("TXYZ") is False
+        assert journal.is_fill_recorded("TXYZ999") is False
 
 
 class TestReconcileFills:
@@ -383,7 +394,7 @@ class TestReconcileFills:
 
         assert journal.is_fill_recorded("TSL001")
         row = journal._conn.execute(
-            "SELECT side, price, fee, fill_source FROM trades WHERE reasoning LIKE '%TSL001%'",
+            "SELECT side, price, fee, fill_source FROM trades WHERE exchange_fill_id = 'TSL001'",
         ).fetchone()
         assert row[0] == "SELL"
         assert row[1] == 69000.0
@@ -402,6 +413,7 @@ class TestReconcileFills:
             reasoning="SL fill [TEXIST1]",
             fee=0.276,
             fill_source="exchange",
+            exchange_fill_id="TEXIST1",
         )
 
         mock_exchange = MagicMock()
@@ -466,7 +478,7 @@ class TestReconcileFills:
 
         assert journal.is_fill_recorded("TBUY01")
         row = journal._conn.execute(
-            "SELECT side, profit, fee, fill_source FROM trades WHERE reasoning LIKE '%TBUY01%'",
+            "SELECT side, profit, fee, fill_source FROM trades WHERE exchange_fill_id = 'TBUY01'",
         ).fetchone()
         assert row[0] == "BUY"
         assert row[1] == 0.0  # BUY fills have no P&L

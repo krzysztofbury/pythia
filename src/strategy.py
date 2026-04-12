@@ -22,6 +22,13 @@ v8.1 — Post-deployment tuning:
   - Stale position timeout 72h → 120h (stale exits were #1 loss source)
   - Gate entry on negative technicals (prevents buying overbought)
   - Gate entry on MTF bearish conflict (stops buying into downtrends)
+
+v8.2 — Post-analysis tuning (April 2026):
+  - Hard-block all entries in TRENDING_DOWN regime (no buying into downtrends)
+  - Entry threshold 0.15 → 0.25 (kill low-conviction entries that become stale exits)
+  - Mean reversion bonus gated to RANGING regime only (was firing in early downtrends)
+  - TRENDING_DOWN regime modifier now dampens positive composites (x0.80)
+  - Fear & Greed weight 0.05 → 0.05 (unchanged, but technical weight absorbs more)
 """
 
 import logging
@@ -66,7 +73,7 @@ assert abs(_WEIGHT_SUM - 1.0) < 1e-9, f"Weights must sum to 1.0, got {_WEIGHT_SU
 _ENTRY_THRESHOLD = 0.25  # Was 0.15 — still too many low-conviction entries becoming stale exits
 _EXIT_THRESHOLD = -0.05
 _STRONG_SELL_THRESHOLD = -0.25
-_DCA_THRESHOLD = 0.25
+_DCA_THRESHOLD = 0.30  # Was 0.25 — DCA should require stronger signals than initial entry
 _PROFIT_TAKE_PCT = 5.0
 _MOMENTUM_WEAK_THRESHOLD = 0.1
 _SMA_OVEREXTENDED_PCT = 15.0  # Block entry when price is >15% above SMA-7
