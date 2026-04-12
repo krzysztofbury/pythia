@@ -278,6 +278,28 @@ class TestStrategist:
         assert signal.action == "BUY"
         assert "DCA" in signal.reasoning
 
+    def test_trending_down_blocks_buy(self):
+        """TRENDING_DOWN regime must always produce HOLD, never BUY."""
+        from models import MarketRegime
+
+        data = _make_data(
+            sentiment="BULLISH: Strong inflows.",
+            consensus="UP, 72%, Bullish consensus.",
+            indicators=IndicatorSnapshot(
+                rsi=28.0,
+                macd_histogram=0.01,
+                bb_pct_b=0.10,
+                atr_pct=3.0,
+                adx=35.0,
+                roc=-1.5,
+                obv_slope=0.1,
+            ),
+            regime=MarketRegime.TRENDING_DOWN,
+        )
+        signal = self.strategist.generate_signal(data)
+        assert signal.action == "HOLD"
+        assert "TRENDING_DOWN" in signal.reasoning
+
 
 # ---------------------------------------------------------------------------
 # Regime-aware and multi-timeframe tests

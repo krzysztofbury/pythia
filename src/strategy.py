@@ -609,6 +609,17 @@ class Strategist:
             _rc = RegimeClassifier()
             effective_entry_threshold += _rc.get_entry_threshold_adjustment(data.regime)
 
+        # v8.2: Hard-block all entries in TRENDING_DOWN
+        from models import MarketRegime as _MR
+
+        if data.regime == _MR.TRENDING_DOWN and not data.has_position:
+            return TradeSignal(
+                action="HOLD",
+                confidence=raw_confidence,
+                composite=composite,
+                reasoning=f"Blocked: TRENDING_DOWN regime — no new entries. {', '.join(reasons)}",
+            )
+
         if data.has_position:
             return self._exit_signal(
                 composite,
