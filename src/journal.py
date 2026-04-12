@@ -277,6 +277,64 @@ class TradeJournal:
         assert total_qty > 0, "Division guard: total_qty must be positive"  # noqa: S101
         return total_cost / total_qty
 
+    def get_last_sync_timestamp(self, ticker: str) -> int | None:
+        """Get the ms timestamp of the most recent trade for this ticker."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT timestamp FROM trades WHERE instrument = ? ORDER BY id DESC LIMIT 1",
+                (ticker,),
+            ).fetchone()
+        if not row:
+            return None
+        dt = datetime.datetime.fromisoformat(row[0])
+        return int(dt.timestamp() * 1000)
+
+    def is_fill_recorded(self, exchange_trade_id: str) -> bool:
+        """Check if a Kraken fill ID is already in our journal.
+        We embed the exchange trade ID in the reasoning field as [ID].
+        """
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT 1 FROM trades WHERE reasoning LIKE ?",
+                (f"%[{exchange_trade_id}]%",),
+            ).fetchone()
+        return row is not None
+
+    def compute_pnl_with_fees(
+        self,
+        ticker: str,
+        sell_price: float,
+        sell_qty: float,
+        sell_fee: float,
+    ) -> tuple[float, float]:
+        """Calculate realized P&L including buy and sell fees.
+        Returns (profit_after_fees, tax). Tax rate = 0.19.
+        """
+        avg_cost = self.get_average_cost_basis(ticker)
+        if avg_cost is None:
+            avg_cost = sell_price
+
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COALESCE(SUM(fee), 0.0) FROM trades WHERE instrument = ? AND side = 'BUY'",
+                (ticker,),
+            ).fetchone()
+        total_buy_fees = float(row[0]) if row else 0.0
+
+        with self._lock:
+            qty_row = self._conn.execute(
+                "SELECT COALESCE(SUM(quantity), 0.0) FROM trades "
+                "WHERE instrument = ? AND side = 'BUY'",
+                (ticker,),
+            ).fetchone()
+        total_buy_qty = float(qty_row[0]) if qty_row else 1.0
+
+        proportional_buy_fee = total_buy_fees * (sell_qty / max(total_buy_qty, 1e-12))
+        gross_profit = (sell_price - avg_cost) * sell_qty
+        profit = gross_profit - proportional_buy_fee - sell_fee
+        tax = profit * 0.19 if profit > 0 else 0.0
+        return profit, tax
+
     def get_position_open_time(self, ticker: str) -> datetime.datetime | None:
         """Return the timestamp of the earliest un-exited BUY for a ticker."""
         with self._lock:
