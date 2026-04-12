@@ -36,9 +36,11 @@ def parse_roi_schedule(schedule_str: str) -> list[tuple[int, float]]:
     Format: "0:4.0,60:3.0,120:2.0,240:1.0"
     Returns: [(0, 4.0), (60, 3.0), (120, 2.0), (240, 1.0)]
     """
+    # Strip surrounding quotes that .env files may include
+    schedule_str = schedule_str.strip().strip('"').strip("'")
     pairs = []
     for item in schedule_str.split(","):
-        item = item.strip()
+        item = item.strip().strip('"').strip("'")
         if ":" not in item:
             continue
         minutes_str, pct_str = item.split(":", 1)

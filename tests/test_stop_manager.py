@@ -47,6 +47,16 @@ class TestParseRoiSchedule:
         result = parse_roi_schedule("0:4.0,bad,60:3.0")
         assert result == [(0, 4.0), (60, 3.0)]
 
+    def test_quoted_schedule_from_env(self):
+        """Handles .env values wrapped in double quotes: ROI_SCHEDULE="0:4.0,60:3.0"."""
+        result = parse_roi_schedule('"0:4.0,60:3.0,120:2.0,240:1.0"')
+        assert result == [(0, 4.0), (60, 3.0), (120, 2.0), (240, 1.0)]
+
+    def test_single_quoted_schedule_from_env(self):
+        """Handles .env values wrapped in single quotes."""
+        result = parse_roi_schedule("'0:4.0,60:3.0'")
+        assert result == [(0, 4.0), (60, 3.0)]
+
 
 # ---------------------------------------------------------------------------
 # compute_trailing_sl
@@ -286,7 +296,11 @@ class TestAdjust:
         state = self._state(entry_price=100.0)
         # pnl 5% at 0 min => ROI tier 0:4.0 hit
         action = self.mgr.adjust(
-            state, current_price=115.0, atr=5.0, pnl_pct=5.0, position_age_minutes=10
+            state,
+            current_price=115.0,
+            atr=5.0,
+            pnl_pct=5.0,
+            position_age_minutes=10,
         )
         assert action.action == "SELL"
         assert "ROI exit" in action.reason
@@ -296,7 +310,11 @@ class TestAdjust:
         state = self._state(entry_price=100.0)
         # pnl 2% at 0 min < 4.0% ROI target, but profit_in_atr = 10/5 = 2.0 >= 2.0
         action = self.mgr.adjust(
-            state, current_price=110.0, atr=5.0, pnl_pct=2.0, position_age_minutes=10
+            state,
+            current_price=110.0,
+            atr=5.0,
+            pnl_pct=2.0,
+            position_age_minutes=10,
         )
         assert action.action == "PARTIAL_SELL"
         assert action.sell_pct == pytest.approx(0.50)
@@ -312,7 +330,11 @@ class TestAdjust:
         # pnl 1% < 4% => no ROI. Partial blocked. price=108, atr=5
         # trailing_sl = max(108, 108) - 1.5*5 = 100.5 > 90 => updated
         action = self.mgr.adjust(
-            state, current_price=108.0, atr=5.0, pnl_pct=1.0, position_age_minutes=10
+            state,
+            current_price=108.0,
+            atr=5.0,
+            pnl_pct=1.0,
+            position_age_minutes=10,
         )
         assert action.action == "HOLD"
         assert action.updated_sl == pytest.approx(100.5)
@@ -330,7 +352,11 @@ class TestAdjust:
         # trailing_sl = max(100, 106) - 1.5*5 = 106 - 7.5 = 98.5 > 90 => 98.5
         # breakeven = 100 => max(98.5, 100) = 100
         action = self.mgr.adjust(
-            state, current_price=106.0, atr=5.0, pnl_pct=1.0, position_age_minutes=10
+            state,
+            current_price=106.0,
+            atr=5.0,
+            pnl_pct=1.0,
+            position_age_minutes=10,
         )
         assert action.action == "HOLD"
         assert action.updated_sl == pytest.approx(100.0)
@@ -346,7 +372,11 @@ class TestAdjust:
         )
         # FIXED mode => no trailing adjustment. SL stays 95. price 94 <= 95 => SELL
         action = self.mgr.adjust(
-            state, current_price=94.0, atr=5.0, pnl_pct=-6.0, position_age_minutes=10
+            state,
+            current_price=94.0,
+            atr=5.0,
+            pnl_pct=-6.0,
+            position_age_minutes=10,
         )
         assert action.action == "SELL"
         assert "Stop-loss triggered" in action.reason
@@ -362,7 +392,11 @@ class TestAdjust:
         )
         # FIXED mode, price 102 > SL 90, pnl 2% < ROI 4%, partial blocked
         action = self.mgr.adjust(
-            state, current_price=102.0, atr=5.0, pnl_pct=2.0, position_age_minutes=10
+            state,
+            current_price=102.0,
+            atr=5.0,
+            pnl_pct=2.0,
+            position_age_minutes=10,
         )
         assert action.action == "HOLD"
         assert action.updated_sl == pytest.approx(90.0)
@@ -378,7 +412,11 @@ class TestAdjust:
             partial_exits=1,
         )
         action = self.mgr.adjust(
-            state, current_price=118.0, atr=5.0, pnl_pct=1.0, position_age_minutes=10
+            state,
+            current_price=118.0,
+            atr=5.0,
+            pnl_pct=1.0,
+            position_age_minutes=10,
         )
         assert action.action == "HOLD"
         assert action.updated_sl == pytest.approx(90.0)  # Unchanged
@@ -395,7 +433,11 @@ class TestAdjust:
         # price=106, atr=5 => trailing_sl = 106 - 7.5 = 98.5
         # breakeven would be 100 but TRAILING mode doesn't check it
         action = self.mgr.adjust(
-            state, current_price=106.0, atr=5.0, pnl_pct=1.0, position_age_minutes=10
+            state,
+            current_price=106.0,
+            atr=5.0,
+            pnl_pct=1.0,
+            position_age_minutes=10,
         )
         assert action.action == "HOLD"
         assert action.updated_sl == pytest.approx(98.5)  # Not 100
@@ -411,7 +453,11 @@ class TestAdjust:
             partial_exits=1,
         )
         action = mgr.adjust(
-            state, current_price=110.0, atr=5.0, pnl_pct=10.0, position_age_minutes=500
+            state,
+            current_price=110.0,
+            atr=5.0,
+            pnl_pct=10.0,
+            position_age_minutes=500,
         )
         assert action.action == "HOLD"
 
@@ -425,7 +471,11 @@ class TestAdjust:
             partial_exits=1,
         )
         action = self.mgr.adjust(
-            state, current_price=108.0, atr=None, pnl_pct=1.0, position_age_minutes=10
+            state,
+            current_price=108.0,
+            atr=None,
+            pnl_pct=1.0,
+            position_age_minutes=10,
         )
         assert action.action == "HOLD"
         assert action.updated_sl == pytest.approx(95.0)
