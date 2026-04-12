@@ -319,6 +319,28 @@ class TestStrategist:
         if signal.composite < 0.25:
             assert signal.action == "HOLD"
 
+    def test_mean_reversion_only_in_ranging(self):
+        """Mean reversion bonus must NOT fire outside RANGING regime."""
+        from models import MarketRegime
+
+        data = _make_data(
+            sentiment="BULLISH: Strong inflows.",
+            consensus="UP, 68%, Bullish.",
+            has_position=True,
+            entry_price=43000.0,
+            indicators=IndicatorSnapshot(
+                rsi=25.0,
+                macd_histogram=0.01,
+                bb_pct_b=1.1,
+                atr_pct=3.0,
+                adx=18.0,
+                obv_slope=0.5,
+            ),
+            regime=MarketRegime.BREAKOUT,
+        )
+        signal = self.strategist.generate_signal(data)
+        assert "mean-reversion" not in signal.reasoning
+
 
 # ---------------------------------------------------------------------------
 # Regime-aware and multi-timeframe tests
@@ -351,15 +373,17 @@ class TestRegimeModifier:
         assert reason is not None
         assert "TRENDING_DOWN" in reason
 
-    def test_regime_modifier_sign_mismatch_is_noop(self):
-        """Positive composite in TRENDING_DOWN should be no-op."""
+    def test_regime_modifier_trending_down_dampens_positive(self):
+        """Positive composite in TRENDING_DOWN should be dampened (x0.80)."""
         from models import MarketRegime
         from strategy import _apply_regime_modifier
 
         composite = 0.20
         result, reason = _apply_regime_modifier(composite, MarketRegime.TRENDING_DOWN)
-        assert result == composite  # No modification
-        assert "no-op" in reason
+        assert abs(result - composite * 0.80) < 1e-9
+        assert reason is not None
+        assert "TRENDING_DOWN" in reason
+        assert "x0.80" in reason
 
     def test_regime_modifier_none_is_noop(self):
         """None regime should not modify composite."""

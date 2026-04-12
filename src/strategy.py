@@ -417,9 +417,13 @@ def _apply_regime_modifier(
     # Bullish regimes boost positive composites only
     if regime == MarketRegime.TRENDING_UP and composite > 0:
         return composite * 1.10, "regime=TRENDING_UP(x1.10)"
-    # Bearish regime amplifies negative composites (stronger sell signal)
-    if regime == MarketRegime.TRENDING_DOWN and composite < 0:
-        return composite * 1.20, "regime=TRENDING_DOWN(x1.20)"
+    # Bearish regime: dampen positive composites, amplify negative ones
+    if regime == MarketRegime.TRENDING_DOWN:
+        if composite > 0:
+            return composite * 0.80, "regime=TRENDING_DOWN(x0.80)"
+        if composite < 0:
+            return composite * 1.20, "regime=TRENDING_DOWN(x1.20)"
+        return composite, "regime=TRENDING_DOWN(no-op)"
     # Range regime boosts positive composites (mean reversion)
     if regime == MarketRegime.RANGING and composite > 0:
         return composite * 1.05, "regime=RANGING(x1.05)"
@@ -556,15 +560,18 @@ class Strategist:
         # of forecast/sentiment alignment.
         # Disabled during EXTREME volatility for safety.
         # ---------------------------------------------------------------
+        from models import MarketRegime as _MR
+
         if (
-            rsi is not None
+            data.regime == _MR.RANGING
+            and rsi is not None
             and rsi < _MEAN_REVERSION_RSI
             and adx is not None
             and adx < _MEAN_REVERSION_ADX
             and volatility_regime != "EXTREME"
         ):
             composite += _MEAN_REVERSION_BONUS
-            reasons.append("mean-reversion(oversold+weak-trend)")
+            reasons.append("mean-reversion(oversold+weak-trend+RANGING)")
 
         # Regime modifier
         composite, regime_reason = _apply_regime_modifier(composite, data.regime)
