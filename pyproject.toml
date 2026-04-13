@@ -1,7 +1,7 @@
 [project]
 name = "oracle-pythia"
-version = "8.0.0"
-description = "Add your description here"
+version = "8.2.0"
+description = "Autonomous crypto trading bot on Kraken with algorithmic strategy, Grok sentiment, Polymarket odds, and quantitative analysis."
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
@@ -53,3 +53,9 @@ ignore = [
 [tool.ruff.format]
 quote-style = "double"
 indent-style = "space"
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+
+[tool.uv]
+exclude-newer = "2026-05-13T00:00:00Z"

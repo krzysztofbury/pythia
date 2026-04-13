@@ -11,13 +11,14 @@ resolution-markers = [
 ]
 
 [options]
-exclude-newer = "2026-03-04T17:00:55.84697Z"
-exclude-newer-span = "P30D"
+exclude-newer = "2026-05-13T00:00:00Z"
 
 [options.exclude-newer-package]
 desia-logging = false
 desia-gcp = false
+librus-apix = false
 desia-db = false
+librus-mcp = false
 
 [[package]]
 name = "aiodns"
@@ -1238,7 +1239,7 @@ wheels = [
 
 [[package]]
 name = "oracle-pythia"
-version = "8.0.0"
+version = "8.2.0"
 source = { virtual = "." }
 dependencies = [
     { name = "arch" },

@@ -241,26 +241,165 @@ All settings can be overridden via environment variables or `.env`:
 | `LOG_MAX_BYTES` | `10485760` | Max log file size before rotation (10MB) |
 | `LOG_BACKUP_COUNT` | `5` | Number of rotated log files to keep |
 
-## Docker
+## Docker Deployment
 
-The bot runs as two containers: the trading bot and a Cloudflare WARP sidecar that proxies Polymarket traffic. Includes Docker HEALTHCHECK that auto-restarts if no cycle completes within 2 hours.
+The bot runs as two containers: the trading bot and a Cloudflare WARP sidecar that proxies Polymarket traffic. Docker HEALTHCHECK auto-restarts if no cycle completes within 1 hour.
+
+| Service | Image | Purpose |
+|---|---|---|
+| `oracle-pythia` | `ghcr.io/astral-sh/uv:python3.13-bookworm-slim` | Trading bot |
+| `warp-proxy` | `ghcr.io/mon-ius/docker-warp-socks:v5` | SOCKS5 proxy for Polymarket (port 9091) |
+
+Only Polymarket API calls route through the WARP proxy. All other traffic (Kraken, Grok, CMC) uses direct connections.
+
+### Quick Start (Docker)
+
+```bash
+# 1. Clone the repo
+git clone https://github.com/your-user/oracle-pythia.git
+cd oracle-pythia
+
+# 2. Configure environment
+cp .env.example .env
+# Edit .env with your API keys (see Required Keys above)
+
+# 3. Start in paper mode first (default)
+docker compose up -d
+
+# 4. Check logs
+docker logs -f oracle-pythia
+
+# 5. When ready for live trading, edit .env:
+#    TRADING_MODE=LIVE
+#    Then restart:
+docker compose restart oracle-pythia
+```
+
+### Step-by-Step Docker Installation
+
+#### Prerequisites
+
+- Docker Engine 24+ and Docker Compose v2+
+- Kraken account with API key (Query Funds + Modify Orders permissions only — **never enable Withdrawal**)
+- xAI (Grok) API key from [x.ai](https://x.ai)
+
+#### 1. Clone and Configure
+
+```bash
+git clone https://github.com/your-user/oracle-pythia.git
+cd oracle-pythia
+cp .env.example .env
+```
+
+Edit `.env` with your editor:
+
+```bash
+# Required
+KRAKEN_API_KEY=your_kraken_api_key
+KRAKEN_PRIVATE_KEY=your_kraken_private_key
+XAI_API_KEY=your_grok_api_key
+
+# Start in PAPER mode to validate
+TRADING_MODE=PAPER
+
+# Adjust the trading universe to your quote currency
+QUOTE_CURRENCY=USDC
+TRADING_UNIVERSE=BTC/USDC,ETH/USDC,LINK/USDC
+
+# Set position size (max $100 hard cap)
+MAX_POSITION_SIZE_USD=50.0
+```
+
+Secure the file:
+
+```bash
+chmod 600 .env
+```
+
+#### 2. Build and Start
+
+Using Docker Compose (recommended):
 
 ```bash
 docker compose up -d
 ```
 
-| Service | Image | Purpose |
-|---|---|---|
-| `oracle-pythia` | `uv:python3.13-bookworm-slim` | Trading bot |
-| `warp-proxy` | `ghcr.io/mon-ius/docker-warp-socks:v5` | SOCKS5 proxy for Polymarket (port 9091) |
+Or build the image directly:
 
-Only Polymarket API calls route through the WARP proxy. All other traffic (Kraken, Grok, CMC) uses direct connections.
+```bash
+docker build -t oracle-pythia .
+docker run -d \
+  --name oracle-pythia \
+  --restart unless-stopped \
+  -v $(pwd)/logs:/app/logs \
+  -v $(pwd)/.env:/app/.env:ro \
+  -e PYTHONPATH=/app/src \
+  -e PYTHONUNBUFFERED=1 \
+  oracle-pythia
+```
+
+#### 3. Verify
+
+```bash
+# Check the bot is running
+docker logs -f oracle-pythia
+
+# You should see:
+# --- ORACLE PYTHIA BOOTING VERSION 8.2 ---
+# Oracle Pythia Bot Started.
+# Starting FULL Cycle. Mode: PAPER
+# ...
+```
+
+#### 4. Monitor
+
+```bash
+# Live logs
+docker logs -f oracle-pythia
+
+# Trade database (from host)
+sqlite3 logs/trades.db "SELECT date, instrument, side, price, profit FROM trades ORDER BY id DESC LIMIT 10;"
+
+# Health check
+cat logs/healthcheck
+
+# Portfolio summary
+sqlite3 logs/trades.db "SELECT ROUND(SUM(profit),2) as pnl, COUNT(*) as trades FROM trades;"
+```
+
+#### 5. Switch to Live Trading
+
+After validating in paper mode:
+
+```bash
+# Edit .env
+sed -i 's/TRADING_MODE=PAPER/TRADING_MODE=LIVE/' .env
+
+# Restart
+docker compose restart oracle-pythia
+```
+
+#### 6. NAS / Server Deployment (QNAP, Synology, etc.)
+
+For headless server deployment:
+
+1. Copy the entire repo to your NAS
+2. Create `.env` with your production keys
+3. Adjust `docker-compose.yml` volumes if your paths differ
+4. Run `docker compose up -d`
+5. The HEALTHCHECK will auto-restart the container if it hangs
+
+Docker Compose handles:
+- Automatic restart on failure (`restart: unless-stopped`)
+- Health monitoring (checks every 5 minutes, restarts after 3 failures)
+- WARP proxy sidecar for Polymarket access
+- Log persistence via volume mount (`./logs:/app/logs`)
 
 ### Logs & Data
 
 | File | Description |
 |---|---|
-| `logs/bot.log` | Main bot log (rotating, 10MB) — the only file-based log |
+| `logs/bot.log` | Main bot log (time-rotated daily, 7-day retention) |
 | `logs/trades.db` | SQLite database — single source of truth for all structured data |
 | `logs/healthcheck` | Healthcheck timestamp (used by Docker) |
 
@@ -268,24 +407,43 @@ All structured data lives in SQLite (`trades.db`):
 
 | Table | Contents |
 |---|---|
-| `trades` | Trade journal (BUY/SELL/CANCEL records with P&L and tax) |
-| `signals` | All trading signals with composite scores (replaces signals.jsonl) |
+| `trades` | Trade journal with P&L, fees, and exchange fill IDs |
+| `signals` | All trading signals with composite scores |
 | `position_state` | Per-position stop tracking (high watermark, SL/TP, partial exits) |
 | `market_snapshots` | Full market context per cycle for backtest replay |
-| `optimization_runs` | Optuna optimization results (replaces optimization.json) |
+| `optimization_runs` | Optuna optimization results |
 
 ## Development
 
-- **Linting**:
-  ```bash
-  uv run ruff check .
-  uv run mypy .
-  ```
-- **Tests** (137+ tests):
-  ```bash
-  PYTHONPATH=src uv run pytest
-  ```
-- **Optimizer**:
-  ```bash
-  PYTHONPATH=src uv run python src/optimizer.py --symbol BTC/USDC --trials 200
-  ```
+```bash
+# Install dependencies
+uv sync
+
+# Run tests (214+ tests)
+uv run pytest tests/ -v
+
+# Lint
+uv run ruff check src/ tests/
+
+# Type check
+uv run mypy src/ --ignore-missing-imports
+
+# Run optimizer
+PYTHONPATH=src uv run python src/optimizer.py --symbol BTC/USDC --trials 200
+
+# Run P&L reconciliation migration
+PYTHONPATH=src uv run python src/migrate_reconcile_pnl.py --dry-run
+```
+
+### Pre-commit Hooks
+
+```bash
+uv tool install pre-commit
+pre-commit install
+```
+
+Hooks run automatically on commit: ruff linting/formatting, trailing whitespace, secret detection.
+
+## License
+
+MIT License. See [LICENSE](LICENSE) for details.
