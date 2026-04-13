@@ -35,3 +35,5 @@ logs/
 # OS
 .DS_Store
 Thumbs.db
+/docs/
+/.claude/
