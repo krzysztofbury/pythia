@@ -1,4 +1,4 @@
-# Oracle Pythia v8.0
+# Oracle Pythia v8.2
 
 An autonomous crypto trading bot on Kraken, driven by algorithmic strategy (weighted composite scoring), Grok (Sentiment), Polymarket (Prediction Markets), quantitative analysis (Technical Indicators, GARCH Volatility, ARIMA Forecasting), and market regime detection.
 

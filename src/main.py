@@ -728,6 +728,19 @@ def _execute_sell(  # noqa: PLR0913
         logger.info("Sell skipped for %s: no significant balance.", ticker)
         return
 
+    # Dust detection: if USD value is below Kraken minimum, clean up instead of selling
+    usd_value = price * amount_to_sell
+    if usd_value < MIN_ORDER_USD:
+        logger.info(
+            "Dust position detected for %s: %.8f (worth $%.2f < $%.0f min). Cleaning up.",
+            ticker,
+            amount_to_sell,
+            usd_value,
+            MIN_ORDER_USD,
+        )
+        journal.delete_position_state(ticker)
+        return
+
     profit = 0.0
     tax = 0.0
     if buy_price:
@@ -1892,7 +1905,7 @@ def main() -> None:
         return
 
     setup_logging(settings)
-    logger.info("--- ORACLE PYTHIA BOOTING VERSION 8.0 ---")
+    logger.info("--- ORACLE PYTHIA BOOTING VERSION 8.2 ---")
 
     shutdown_event = threading.Event()
 
