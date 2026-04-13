@@ -4,6 +4,19 @@ Long-term improvements for transforming the bot into a quantitative trading syst
 These items require data infrastructure, historical data feeds, and validation frameworks
 that go beyond the current algorithmic scoring engine.
 
+## v8.2 Foundation (April 2026)
+
+The following infrastructure was built in v8.2 and unblocks several roadmap items:
+
+- **Fill reconciliation** (`fetch_my_trades` + `_reconcile_fills`): syncs actual Kraken fills
+  every cycle, tracks fees, detects SL/TP fills. Provides accurate per-trade P&L.
+- **`exchange_fill_id` column** with index: links journal trades to Kraken fill IDs.
+- **`fee` column**: actual or estimated Kraken fee per trade.
+- **`compute_pnl_with_fees`**: FIFO cost basis with proportional fee deduction.
+- **Migration script** (`migrate_reconcile_pnl.py`): one-time historical P&L correction.
+- **Strategy discipline**: TRENDING_DOWN hard block, entry threshold 0.25, per-cycle limit (2),
+  mean reversion gated to RANGING, DOGE removed from universe.
+
 ---
 
 ## 1. Walk-Forward Backtesting
@@ -28,6 +41,10 @@ This reveals overfitting and measures true out-of-sample performance.
 hard thresholds. Hidden Markov Models learn regime transitions from data,
 adapting to changing market dynamics.
 
+**v8.2 note:** Rule-based regime detection is now *effective* — TRENDING_DOWN hard-blocks
+entries, modifier dampens positive composites (x0.80). HMM would replace thresholds
+with learned transitions but the current system is no longer broken.
+
 **What to build:**
 - HMM with 3-4 hidden states trained on returns + volatility + volume
 - Online regime probability estimation (no future data leakage)
@@ -43,6 +60,9 @@ adapting to changing market dynamics.
 **Why:** Current system allocates fixed USD per slot regardless of per-asset risk.
 A 1% move in BTC is very different from a 1% move in SHIB.
 
+**v8.2 note:** Per-cycle entry limit (max 2) provides crude throttling.
+Per-asset win rate is now trackable via fee-adjusted P&L per instrument.
+
 **What to build:**
 - Volatility-scaled position sizing: allocate based on inverse ATR
   (lower volatility = larger position, higher = smaller)
@@ -50,7 +70,7 @@ A 1% move in BTC is very different from a 1% move in SHIB.
 - Risk parity across portfolio: equal risk contribution per position
 - Maximum portfolio VaR constraint
 
-**Dependencies:** Per-asset win rate tracking, rolling Sharpe per ticker
+**Dependencies:** Per-asset win rate tracking (now available), rolling Sharpe per ticker
 
 ---
 
@@ -59,6 +79,10 @@ A 1% move in BTC is very different from a 1% move in SHIB.
 **Why:** We don't know how fast our signals become stale or which signals
 actually predict returns. This is the foundation of signal research.
 
+**v8.2 note:** Foundation is in place — `exchange_fill_id` links fills to journal,
+`fee` column enables accurate P&L, `compute_pnl_with_fees` gives true per-trade returns.
+MAE/MFE analysis is now feasible using `market_snapshots` + accurate P&L.
+
 **What to build:**
 - Signal half-life measurement: how many candles until signal loses predictive power
 - Win rate by regime: measure if BUY signals in TRENDING_UP are better than in RANGING
@@ -66,7 +90,7 @@ actually predict returns. This is the foundation of signal research.
 - Maximum Favorable Excursion (MFE): best unrealized profit during each trade
 - Factor attribution: which composite components contributed most to winning trades
 
-**Dependencies:** market_snapshots table (already built), trade journal enrichment
+**Dependencies:** market_snapshots table (built), fee-adjusted P&L (built in v8.2)
 
 ---
 
@@ -92,13 +116,17 @@ short-term predictive edge.
 **Why:** Current backtest uses empty strings for sentiment/consensus/polymarket.
 Without historical context data, backtests don't reflect real performance.
 
+**v8.2 note:** `fetch_all_kraken_fills` (in migration script) paginates through
+all historical Kraken fills. Can be adapted into a data feed for backtesting
+with actual execution prices and fees.
+
 **What to build:**
 - Historical Fear & Greed Index data feed (CoinMarketCap or Alternative.me API)
 - Historical Polymarket resolution data for specific crypto markets
 - Grok sentiment archival: store and replay sentiment scores over time
 - Data quality scoring: measure what % of backtest has real vs synthetic data
 
-**Dependencies:** market_snapshots table (already built), external API subscriptions
+**Dependencies:** market_snapshots table (built), external API subscriptions
 
 ---
 
@@ -152,6 +180,9 @@ provides mathematically optimal allocation strategies.
 
 **Why:** Sharpe ratio alone is insufficient. Crypto returns are non-normal
 (fat tails, skewness), requiring specialized metrics.
+
+**v8.2 note:** Fee-adjusted P&L makes all these metrics meaningful now.
+Previously computed from fictional P&L (+$94 vs real -$30).
 
 **What to build:**
 - Sortino ratio (downside deviation only)
