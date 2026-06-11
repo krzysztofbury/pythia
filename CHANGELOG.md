@@ -3,6 +3,36 @@
 All notable changes to Oracle Pythia are documented here.
 The format is loosely based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [9.7.0] — 2026-06-11
+
+### Added
+
+- **Funding rate wired into the composite** (TODO #1): new `W_FUNDING=0.03`
+  component (technical 0.35→0.34, sentiment 0.20→0.19, consensus 0.10→0.09).
+  Contrarian sign: negative funding scores bullish, saturating at ±0.1%/8h.
+  Active only when `FUNDING_RATES_ENABLED` supplies data — absent data
+  redistributes the weight, so default behaviour is unchanged. Factor
+  attribution and the Optuna optimizer sample the new `fund=` component.
+
+### Fixed
+
+- **Failed sells no longer orphan positions**: `execute_sell` returns success;
+  StopManager/strategic-exit/take-profit paths delete `position_state` only
+  when the order was actually placed. Previously a Kraken error during a stop
+  sell dropped all stop tracking while the coins were still held.
+- **Fill-reconciliation double counting**: dedup window widened 15→180 min
+  (maker orders live up to 2h before stale cleanup — fills landing later were
+  journaled on top of the placement row, inflating cost basis; observed live
+  on 2026-04-22 LINK). Sub-$1 partial-fill residues are skipped entirely.
+- **`UPDATE` is not `UP`**: consensus direction parsing now uses word
+  boundaries; prose like "UPDATE:" or "DOWNTREND" no longer false-positives a
+  direction and (with a stray percentage) blocks or authorizes entries.
+- **"Insufficient data" LLM responses count as unavailable**, excluded from
+  the composite's effective weight (observed live: Gemini/Grok answer
+  "Insufficient recent data available" when they cannot browse).
+
+---
+
 ## [9.6.0] — 2026-06-11
 
 Incident-driven release. The LIVE bot executed **zero trades from 2026-04-23 to

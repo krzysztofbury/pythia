@@ -128,6 +128,7 @@ class StrategyOptimizer:
             "consensus": trial.suggest_float("w_consensus", 0.05, 0.15),
             "polymarket": trial.suggest_float("w_polymarket", 0.05, 0.25),
             "fear_greed": trial.suggest_float("w_fear_greed", 0.05, 0.15),
+            "funding": trial.suggest_float("w_funding", 0.00, 0.08),
         }
         weights = _normalize_weights(raw_weights)
         entry_threshold = trial.suggest_float("entry_threshold", 0.15, 0.40)

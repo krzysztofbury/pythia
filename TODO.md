@@ -4,7 +4,9 @@ Forward-looking work. For what's already shipped see [CHANGELOG.md](CHANGELOG.md
 
 ---
 
-## 1. Wire funding rate into composite score
+## 1. Wire funding rate into composite score — SHIPPED v9.7 (validation pending)
+
+**Status 2026-06-11:** wired as `W_FUNDING=0.03` with contrarian normalization (±0.1%/8h cap) and active-weight redistribution when data is absent. Remaining before trusting it live: enable `FUNDING_RATES_ENABLED=true`, collect 30+ days of `market_snapshots.funding_rate`, walk-forward validate.
 
 **Why:** v9.5 collects perpetual funding rates into `market_snapshots.funding_rate` but `Strategist.generate_signal` does not yet consume them. Funding is a well-known short-term sentiment proxy (negative rates = shorts paying longs = contrarian bullish).
 

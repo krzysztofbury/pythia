@@ -830,6 +830,7 @@ class TestWeightChanges:
             W_CONSENSUS,
             W_FEAR_GREED,
             W_FORECAST,
+            W_FUNDING,
             W_MOMENTUM,
             W_POLYMARKET,
             W_SENTIMENT,
@@ -844,6 +845,7 @@ class TestWeightChanges:
             + W_CONSENSUS
             + W_POLYMARKET
             + W_FEAR_GREED
+            + W_FUNDING
         )
         assert abs(total - 1.0) < 1e-9
 
@@ -854,10 +856,10 @@ class TestWeightChanges:
         assert W_FEAR_GREED == 0.05  # noqa: PLR2004
 
     def test_technical_weight_increased(self):
-        """Technical weight should be 0.35 (was 0.30)."""
+        """Technical weight is 0.34 (v9.7: shaved 0.01 to fund W_FUNDING)."""
         from strategy import W_TECHNICAL
 
-        assert W_TECHNICAL == 0.35  # noqa: PLR2004
+        assert W_TECHNICAL == 0.34  # noqa: PLR2004
 
     def test_entry_threshold(self):
         """Entry threshold should be 0.25 (was 0.15)."""

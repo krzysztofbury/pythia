@@ -61,16 +61,27 @@ logger = logging.getLogger(__name__)
 # so tuning via .env cannot silently diverge from the module fallbacks used by
 # ``Strategist()`` without a ``settings`` argument.
 
-W_TECHNICAL = 0.35
+W_TECHNICAL = 0.34
 W_MOMENTUM = 0.10
 W_FORECAST = 0.05
-W_SENTIMENT = 0.20
-W_CONSENSUS = 0.10
+W_SENTIMENT = 0.19
+W_CONSENSUS = 0.09
 W_POLYMARKET = 0.15
 W_FEAR_GREED = 0.05
+# v9.7: perpetual funding as a contrarian component (negative rate = shorts
+# paying longs = bullish). Active only when FUNDING_RATES_ENABLED supplies
+# data; otherwise the weight redistributes like missing Polymarket.
+W_FUNDING = 0.03
 
 _WEIGHT_SUM = (
-    W_TECHNICAL + W_MOMENTUM + W_FORECAST + W_SENTIMENT + W_CONSENSUS + W_POLYMARKET + W_FEAR_GREED
+    W_TECHNICAL
+    + W_MOMENTUM
+    + W_FORECAST
+    + W_SENTIMENT
+    + W_CONSENSUS
+    + W_POLYMARKET
+    + W_FEAR_GREED
+    + W_FUNDING
 )
 assert abs(_WEIGHT_SUM - 1.0) < 1e-9, f"Weights must sum to 1.0, got {_WEIGHT_SUM}"  # noqa: S101, PLR2004
 
@@ -149,7 +160,7 @@ def _parse_sentiment(sentiment: str) -> tuple[str, float]:
 # Marker substrings emitted by sentiment.py / data_pipeline.py fallback paths.
 # Matching responses carry no market information and must be excluded from the
 # composite's effective weight (same treatment as missing Polymarket data).
-_UNAVAILABLE_MARKERS = ("unavailable", "failed", "timeout")
+_UNAVAILABLE_MARKERS = ("unavailable", "failed", "timeout", "insufficient")
 
 
 def _sentiment_available(text: str) -> bool:
@@ -167,17 +178,36 @@ def _sentiment_available(text: str) -> bool:
 
 
 def _parse_consensus(consensus: str) -> tuple[str, float, float]:
-    """Parse Grok consensus -> (direction, probability, score in [-1, +1])."""
+    """Parse LLM consensus -> (direction, probability, score in [-1, +1])."""
     text = consensus.strip().upper()
 
     prob_match = re.search(r"(\d{1,3})%", text)
     probability = float(prob_match.group(1)) if prob_match else 50.0
 
-    if "UP" in text[:30]:
+    # v9.7: word boundaries — bare substring matching turned "UPDATE" into UP
+    # and "DOWNTREND" into DOWN, letting prose false-positive the direction.
+    if re.search(r"\bUP\b", text[:30]):
         return "UP", probability, (probability - 50) / 50
-    if "DOWN" in text[:30]:
+    if re.search(r"\bDOWN\b", text[:30]):
         return "DOWN", probability, -(probability - 50) / 50
     return "NEUTRAL", 50.0, 0.0
+
+
+# Funding-rate normalization cap: +/-0.1% per 8h funding period is an extreme
+# reading on major perps; anything beyond saturates the score.
+_FUNDING_EXTREME_RATE = 0.001
+
+
+def _parse_funding(funding_rate: float | None) -> tuple[float, bool]:
+    """Normalize a perp funding rate -> (score in [-1, +1], has_data).
+
+    Contrarian sign convention: negative funding (shorts paying longs,
+    crowded short positioning) scores bullish; positive funding bearish.
+    """
+    if funding_rate is None:
+        return 0.0, False
+    score = -funding_rate / _FUNDING_EXTREME_RATE
+    return max(-1.0, min(1.0, score)), True
 
 
 def _parse_polymarket(polymarket_odds: str) -> tuple[float, bool]:
@@ -532,6 +562,7 @@ class Strategist:
         "consensus": W_CONSENSUS,
         "polymarket": W_POLYMARKET,
         "fear_greed": W_FEAR_GREED,
+        "funding": W_FUNDING,
     }
 
     def __init__(
@@ -612,6 +643,7 @@ class Strategist:
         )
         polymarket_score, has_polymarket = _parse_polymarket(data.polymarket_odds)
         fear_greed_score, has_fear_greed = _parse_fear_greed(data.fear_greed)
+        funding_score, has_funding = _parse_funding(data.funding_rate)
 
         # Technical sub-score
         technical_score, rsi, atr_pct, sma_7_deviation_pct, tech_reasons = _compute_technical_score(
@@ -666,6 +698,10 @@ class Strategist:
         if has_fear_greed:
             raw_sum += w["fear_greed"] * fear_greed_score
             effective_weight += w["fear_greed"]
+
+        if has_funding:
+            raw_sum += w["funding"] * funding_score
+            effective_weight += w["funding"]
 
         assert effective_weight > 0, f"Effective weight must be positive, got {effective_weight}"  # noqa: S101
         composite = raw_sum / effective_weight
@@ -726,12 +762,15 @@ class Strategist:
         # ``signal_analytics.factor_attribution`` via regex so the per-factor
         # correlation with trade P&L can be computed post-hoc. Keep the exact
         # ``key=+0.000`` format; the parser's regex is anchored to it.
-        reasons.append(
+        component_token = (
             f"tech={technical_score:+.3f} mom={momentum_score:+.3f} "
             f"fc={forecast_score:+.3f} sent={sentiment_score:+.3f} "
             f"cons={consensus_score:+.3f} poly={polymarket_score:+.3f} "
-            f"fg={fear_greed_score:+.3f}",
+            f"fg={fear_greed_score:+.3f}"
         )
+        if has_funding:
+            component_token += f" fund={funding_score:+.3f}"
+        reasons.append(component_token)
 
         raw_confidence = min(abs(composite), 1.0)
 

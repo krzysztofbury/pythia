@@ -14,6 +14,11 @@ from risk_guardian import MIN_ORDER_USD, RiskGuardian
 
 logger = logging.getLogger("OraclePythia")
 
+# Fills worth less than this are partial-fill residues, not positions.
+DUST_FILL_USD = 1.0
+# Must cover the stale-order lifetime (2h) plus reconciliation lag.
+FILL_DEDUP_WINDOW_MINUTES = 180
+
 
 def compute_protection_prices(
     base_price: float,
@@ -68,8 +73,13 @@ def execute_sell(  # noqa: PLR0913
     journal: TradeJournal,
     notifier: WebhookNotifier | NullNotifier,
     paper_portfolio: PaperPortfolio | None = None,
-) -> None:
-    """Execute a sell order (shared by TP and AI-driven exits)."""
+) -> bool:
+    """Execute a sell order (shared by TP and AI-driven exits).
+
+    Returns True only when an order was actually placed (or paper-recorded).
+    Callers must NOT delete position state on False — v9.7: a failed sell
+    used to drop stop tracking while the coins were still held.
+    """
     assert price > 0, f"Sell price must be positive, got {price}"  # noqa: S101
 
     if settings.trading_mode == "PAPER" and paper_portfolio:
@@ -81,7 +91,7 @@ def execute_sell(  # noqa: PLR0913
 
     if amount_to_sell < 0.0001:  # noqa: PLR2004
         logger.info("Sell skipped for %s: no significant balance.", ticker)
-        return
+        return False
 
     usd_value = price * amount_to_sell
     if usd_value < MIN_ORDER_USD:
@@ -93,7 +103,7 @@ def execute_sell(  # noqa: PLR0913
             MIN_ORDER_USD,
         )
         journal.delete_position_state(ticker)
-        return
+        return False
 
     profit = 0.0
     tax = 0.0
@@ -115,8 +125,12 @@ def execute_sell(  # noqa: PLR0913
 
     if settings.trading_mode == "LIVE":
         logger.info(">>> EXECUTING LIVE SELL for %s <<<", ticker)
-        exchange.cancel_all_orders(ticker)
-        exchange.place_maker_sell(ticker, price, amount_to_sell)
+        try:
+            exchange.cancel_all_orders(ticker)
+            exchange.place_maker_sell(ticker, price, amount_to_sell)
+        except Exception:  # noqa: BLE001
+            logger.warning("Sell order failed for %s.", ticker, exc_info=True)
+            return False
     else:
         logger.info(">>> PAPER: SELL %s @ $%s <<<", ticker, price)
         if paper_portfolio:
@@ -136,6 +150,7 @@ def execute_sell(  # noqa: PLR0913
         fee=price * amount_to_sell * 0.0025,
     )
     notifier.notify_trade(ticker, "SELL", price, amount_to_sell, reason)
+    return True
 
 
 def execute_partial_sell(  # noqa: PLR0913
@@ -228,7 +243,7 @@ def check_take_profit(  # noqa: PLR0913
             data.current_price,
             take_profit_price,
         )
-        execute_sell(
+        sold = execute_sell(
             ticker,
             data.current_price,
             buy_price,
@@ -240,8 +255,9 @@ def check_take_profit(  # noqa: PLR0913
             notifier,
             paper_portfolio,
         )
-        journal.delete_position_state(ticker)
-        return True
+        if sold:
+            journal.delete_position_state(ticker)
+        return sold
 
     return False
 
@@ -511,7 +527,20 @@ def _process_single_fill(
     if side not in ("BUY", "SELL") or fill_price <= 0:
         return
 
-    if journal.has_recent_trade(ticker, side, fill_qty):
+    # v9.7: partial-fill residues (cents) are accounting noise, not trades.
+    if fill_cost < DUST_FILL_USD:
+        logger.info(
+            "Reconciliation: Skipping dust fill for %s ($%.4f) [%s]",
+            ticker,
+            fill_cost,
+            fill_id,
+        )
+        return
+
+    # v9.7: window widened 15 -> 180 min. Maker orders live up to 2h before
+    # stale-order cleanup; fills landing after 15 min were re-journaled on
+    # top of the placement row, double-counting the position.
+    if journal.has_recent_trade(ticker, side, fill_qty, window_minutes=FILL_DEDUP_WINDOW_MINUTES):
         return
 
     profit = 0.0

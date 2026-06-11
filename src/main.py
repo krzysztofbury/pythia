@@ -338,7 +338,7 @@ def main() -> None:
         return
 
     setup_logging(settings)
-    logger.info("--- ORACLE PYTHIA BOOTING VERSION 9.6 ---")
+    logger.info("--- ORACLE PYTHIA BOOTING VERSION 9.7 ---")
     logger.info(
         "Effective config: mode=%s quote=%s universe=%s conviction_sizing=%s "
         "challenger=%s funding=%s sentiment_model=%s fallback=%s "

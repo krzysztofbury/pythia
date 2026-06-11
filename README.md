@@ -1,8 +1,8 @@
-# Oracle Pythia v9.6
+# Oracle Pythia v9.7
 
 An autonomous crypto trading bot on Kraken, driven by algorithmic strategy (weighted composite scoring), Gemini or any LiteLLM-backed model (Sentiment — commentary only, never trade decisions), Polymarket (Prediction Markets), quantitative analysis (Technical Indicators, GARCH Volatility, ARIMA Forecasting), market regime detection, conviction-tiered position sizing, and a ToS-safe LLM Challenger that reviews — but never makes — trade decisions.
 
-## What's New in v9.0 – v9.6
+## What's New in v9.0 – v9.7
 
 See [CHANGELOG.md](CHANGELOG.md) for full release notes.
 
@@ -11,6 +11,7 @@ See [CHANGELOG.md](CHANGELOG.md) for full release notes.
 - **v9.2 — conviction-tiered sizing**: Position size now scales with composite score (0.6× / 1.0× / 1.4× / 2.0× tiers). A 40%-of-balance concentration cap binds per position, and an intra-cycle budget tracker prevents two tier-4 entries in one cycle from stacking to 80% exposure. DCA calls are clamped to 1.0× to stop tier amplification on existing positions. Hard cap ceiling raised $100 → $500 to allow full-conviction sizing on proven accounts.
 - **v9.3 — walk-forward optimizer**: Optuna trials now actually thread the sampled weights + entry threshold into the backtest (the previous implementation sampled params but evaluated defaults — every trial identical). Added `WalkForwardOptimizer` with rolling 60d-train / 20d-test windows for honest out-of-sample metrics. `BacktestResult` adds Sortino, Calmar, Profit Factor. `Strategist.__init__(weights_override=...)` enables per-trial strategy configuration.
 - **v9.4 — signal analytics**: New `SignalAnalyzer` with per-asset P&L breakdown, Maximum Adverse/Favorable Excursion (vs. original position entry — accounts for DCA correctly), and factor attribution that regex-parses composite component scores from signal reasoning and correlates each with realized P&L.
+- **v9.7 — funding composite + execution-truth fixes**: funding rate wired as a 3% contrarian component (opt-in), failed sells keep position state, fill-reconciliation dedup window 15→180 min + dust-fill skip, consensus parsing word-boundaries, "insufficient data" responses excluded from weights.
 - **v9.6 — LLM resilience (incident-driven)**: After 7 silent weeks (hard BULLISH-sentiment gate + exhausted xAI credits + sub-$10 allocations), sentiment became advisory (blocks only BEARISH; legacy gate via `REQUIRE_BULLISH_SENTIMENT=true`), primary model moved to `gemini/gemini-3.5-flash` (`SENTIMENT_MODEL`), sentiment+consensus responses cached per ticker (`SENTIMENT_CACHE_SECONDS=3600`), NEUTRAL/unavailable sentiment no longer drags the composite, guardian sizes sub-tier-1 entries at tier-1 instead of rejecting, round-up floor lowered to $5, slots capped by `MAX_TOTAL_CRYPTO_POSITIONS`, log retention 7→30 days, and a 72h entry-drought webhook alert added.
 - **v9.5 — universe expansion + funding rates**: Default universe now `BTC/USDC, ETH/USDC, SOL/USDC, AVAX/USDC, DOT/USDC, LINK/USDC, XRP/USDC` (USDC quote matches common live setup; SHIB dropped per v9.4 per-asset analysis). Correlation groups regrouped: `btc_core`, `eth_core`, `l1_alt`, `defi`, `payments`, `meme`. New `max_total_crypto_positions=5` portfolio-wide backstop prevents the regrouping from accidentally allowing 7+ correlated positions. Optional `FundingRateFetcher` pulls perpetual funding from a secondary exchange (Binance) as a sentiment proxy; logged to `market_snapshots` for future composite integration.
 
@@ -71,17 +72,18 @@ v9.x collects market data in parallel via `ThreadPoolExecutor`. All shared state
 | `src/optimizer.py` | Optuna-based parameter optimization (single-split + walk-forward modes) |
 | `src/config.py` | Pydantic-based configuration management |
 
-### Strategy Weights (v8.x – v9.5, unchanged)
+### Strategy Weights (v9.7)
 
 | Signal Source | Weight | Notes |
 |---|---|---|
-| Technical (RSI, MACD, BB, OBV) | 35% | Price-derived, most reliable |
-| Sentiment (LLM) | 20% | Continuous 1-10 scoring |
+| Technical (RSI, MACD, BB, OBV) | 34% | Price-derived, most reliable |
+| Sentiment (LLM) | 19% | Continuous 1-10 scoring |
 | Polymarket | 15% | Prediction market implied probabilities |
 | Momentum (ROC + ADX) | 10% |  |
-| Consensus (LLM) | 10% | Narrative/news aggregation |
+| Consensus (LLM) | 9% | Narrative/news aggregation |
 | Forecast (ARIMA) | 5% | Weak for 1h crypto; FLAT threshold 0.3% |
 | Fear & Greed (contrarian) | 5% | Extreme fear = buy, extreme greed = sell |
+| Funding rate (contrarian) | 3% | v9.7 — negative perp funding = bullish; active only with `FUNDING_RATES_ENABLED` |
 
 Weights validated at import time (`sum == 1.0`). Active-weight normalization redistributes missing-data weight to active components. Optimizer can override per-trial via `Strategist(weights_override=...)`.
 

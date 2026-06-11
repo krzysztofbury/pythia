@@ -77,7 +77,7 @@ class SignalAnalyticsSummary:
 # Regex for parsing signal reasoning rows like:
 #   "Algo [BTC/USDC]: comp=+0.138 tech=+0.025 mom=+0.020 fc=+0.000 sent=+0.333"
 _COMPONENT_PATTERN = re.compile(
-    r"\b(?P<key>tech|mom|fc|sent|cons|poly|fg)=(?P<sign>[+-]?)(?P<value>\d+\.\d+)",
+    r"\b(?P<key>tech|mom|fc|sent|cons|poly|fg|fund)=(?P<sign>[+-]?)(?P<value>\d+\.\d+)",
     re.IGNORECASE,
 )
 
@@ -89,6 +89,7 @@ _KEY_TO_COMPONENT = {
     "cons": "consensus",
     "poly": "polymarket",
     "fg": "fear_greed",
+    "fund": "funding",
 }
 
 

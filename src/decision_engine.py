@@ -103,7 +103,7 @@ def evaluate_exit(  # noqa: PLR0913
 
         if stop_action.action == "SELL":
             logger.info("StopManager SELL for %s: %s", ticker, stop_action.reason)
-            execute_sell(
+            sold = execute_sell(
                 ticker,
                 data.current_price,
                 data.entry_price,
@@ -114,7 +114,10 @@ def evaluate_exit(  # noqa: PLR0913
                 notifier,
                 paper_portfolio,
             )
-            journal.delete_position_state(ticker)
+            # v9.7: keep stop tracking when the sell did not go through —
+            # the coins are still held and the next cycle must retry.
+            if sold:
+                journal.delete_position_state(ticker)
             return
 
         if stop_action.action == "PARTIAL_SELL":
@@ -173,7 +176,7 @@ def evaluate_exit(  # noqa: PLR0913
     )
 
     if trade_signal.action == "SELL" and trade_signal.confidence >= settings.min_sell_confidence:
-        execute_sell(
+        sold = execute_sell(
             ticker,
             data.current_price,
             data.entry_price,
@@ -184,7 +187,8 @@ def evaluate_exit(  # noqa: PLR0913
             notifier,
             paper_portfolio,
         )
-        journal.delete_position_state(ticker)
+        if sold:
+            journal.delete_position_state(ticker)
         return
 
     execute_dca(

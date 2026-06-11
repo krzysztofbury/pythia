@@ -13,6 +13,7 @@ class TestStrategistWeightsOverride:
             W_CONSENSUS,
             W_FEAR_GREED,
             W_FORECAST,
+            W_FUNDING,
             W_MOMENTUM,
             W_POLYMARKET,
             W_SENTIMENT,
@@ -29,19 +30,21 @@ class TestStrategistWeightsOverride:
             "consensus": W_CONSENSUS,
             "polymarket": W_POLYMARKET,
             "fear_greed": W_FEAR_GREED,
+            "funding": W_FUNDING,
         }
 
     def test_override_applied(self):
         from strategy import Strategist
 
         custom = {
-            "technical": 0.40,
+            "technical": 0.38,
             "momentum": 0.10,
             "forecast": 0.05,
             "sentiment": 0.15,
             "consensus": 0.10,
             "polymarket": 0.15,
             "fear_greed": 0.05,
+            "funding": 0.02,
         }
         strategist = Strategist(weights_override=custom)
         assert strategist._weights == custom  # noqa: SLF001
@@ -57,6 +60,7 @@ class TestStrategistWeightsOverride:
             "consensus": 0.0,
             "polymarket": 0.0,
             "fear_greed": 0.0,
+            "funding": 0.0,
         }
         with pytest.raises(AssertionError, match="sum to 1.0"):
             Strategist(weights_override=bad)
@@ -115,8 +119,9 @@ class TestStrategistWeightsOverride:
                 "forecast": 0.05,
                 "sentiment": 0.05,
                 "consensus": 0.05,
-                "polymarket": 0.05,
-                "fear_greed": 0.05,
+                "polymarket": 0.04,
+                "fear_greed": 0.04,
+                "funding": 0.02,
             },
         )
         heavy_tech_signal = heavy_tech.generate_signal(data)
@@ -271,8 +276,9 @@ class TestOptimizerPlumbing:
             "forecast": 0.05,
             "sentiment": 0.20,
             "consensus": 0.10,
-            "polymarket": 0.20,
+            "polymarket": 0.18,
             "fear_greed": 0.05,
+            "funding": 0.02,
         }
         factory = _build_strategist_factory(weights, entry_threshold=0.33)
         strategist = factory()
