@@ -62,7 +62,8 @@ CREATE TABLE IF NOT EXISTS market_snapshots (
     fear_greed      TEXT    NOT NULL DEFAULT '',
     polymarket_odds TEXT    NOT NULL DEFAULT '',
     indicators_json TEXT    NOT NULL DEFAULT '{}',
-    regime          TEXT    NOT NULL DEFAULT 'RANGING'
+    regime          TEXT    NOT NULL DEFAULT 'RANGING',
+    funding_rate    REAL
 );
 """
 
@@ -76,7 +77,8 @@ CREATE TABLE IF NOT EXISTS signals (
     confidence      REAL    NOT NULL,
     composite       REAL    NOT NULL,
     vol_regime      TEXT    NOT NULL DEFAULT 'NORMAL',
-    reasoning       TEXT    NOT NULL DEFAULT ''
+    reasoning       TEXT    NOT NULL DEFAULT '',
+    llm_critique    TEXT    NOT NULL DEFAULT ''
 );
 """
 
@@ -126,6 +128,14 @@ class TradeJournal:
                     "exchange_fill_id",
                     "ALTER TABLE trades ADD COLUMN exchange_fill_id TEXT DEFAULT NULL",
                 ),
+                (
+                    "llm_critique",
+                    "ALTER TABLE signals ADD COLUMN llm_critique TEXT NOT NULL DEFAULT ''",
+                ),
+                (
+                    "funding_rate",
+                    "ALTER TABLE market_snapshots ADD COLUMN funding_rate REAL",
+                ),
             ]:
                 try:
                     self._conn.execute(ddl)
@@ -151,14 +161,22 @@ class TradeJournal:
         fee: float = 0.0,
         fill_source: str = "bot",
         exchange_fill_id: str | None = None,
+        timestamp: datetime.datetime | None = None,
     ) -> None:
-        """Insert a new trade record."""
+        """Insert a new trade record.
+
+        ``timestamp`` overrides the record time (tests, backfills); must be
+        timezone-aware when provided.
+        """
         assert price > 0, f"Trade price must be positive, got {price}"  # noqa: S101
         assert quantity > 0, f"Trade quantity must be positive, got {quantity}"  # noqa: S101
         assert side in ("BUY", "SELL", "CANCEL"), f"Unknown trade side: {side!r}"  # noqa: S101
         assert fill_source in ("bot", "exchange"), f"Unknown fill_source: {fill_source!r}"  # noqa: S101
+        assert timestamp is None or timestamp.tzinfo is not None, (  # noqa: S101
+            "timestamp must be timezone-aware"
+        )
 
-        now = datetime.datetime.now(tz=datetime.timezone.utc)
+        now = timestamp or datetime.datetime.now(tz=datetime.timezone.utc)
         days = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
         day_name = days[now.weekday()]
         date_str = now.strftime("%Y-%m-%d")
@@ -191,6 +209,19 @@ class TradeJournal:
                 ),
             )
             self._conn.commit()
+
+    def get_last_entry_timestamp(self) -> datetime.datetime | None:
+        """Most recent BUY timestamp across all instruments (None if never)."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT timestamp FROM trades WHERE side = 'BUY' ORDER BY id DESC LIMIT 1",
+            ).fetchone()
+        if not row:
+            return None
+        ts = datetime.datetime.fromisoformat(row[0])
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=datetime.timezone.utc)
+        return ts
 
     def get_last_buy_price(self, ticker: str) -> float | None:
         """Find the most recent BUY price for a ticker."""
@@ -508,6 +539,7 @@ class TradeJournal:
         polymarket_odds: str,
         indicators_json: str,
         regime: str,
+        funding_rate: float | None = None,
     ) -> None:
         """Persist a market data snapshot for backtest replay."""
         now = datetime.datetime.now(tz=datetime.timezone.utc).isoformat()
@@ -515,8 +547,8 @@ class TradeJournal:
             self._conn.execute(
                 "INSERT INTO market_snapshots "
                 "(timestamp, ticker, price, sentiment, consensus, fear_greed, "
-                " polymarket_odds, indicators_json, regime) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                " polymarket_odds, indicators_json, regime, funding_rate) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     now,
                     ticker,
@@ -527,6 +559,7 @@ class TradeJournal:
                     polymarket_odds,
                     indicators_json,
                     regime,
+                    funding_rate,
                 ),
             )
             self._conn.commit()
@@ -558,7 +591,7 @@ class TradeJournal:
     # Signals (replaces signals.jsonl file)
     # ------------------------------------------------------------------
 
-    def log_signal(
+    def log_signal(  # noqa: PLR0913
         self,
         ticker: str,
         action: str,
@@ -566,14 +599,20 @@ class TradeJournal:
         composite: float,
         vol_regime: str,
         reasoning: str,
+        llm_critique: str = "",
     ) -> None:
-        """Log a trading signal to the database (replaces signals.jsonl)."""
+        """Log a trading signal to the database (replaces signals.jsonl).
+
+        ``llm_critique`` is the formatted challenger output (or "" when the
+        challenger is disabled / not run for this action).
+        """
         now = datetime.datetime.now(tz=datetime.timezone.utc).isoformat()
         with self._lock:
             self._conn.execute(
                 "INSERT INTO signals "
-                "(timestamp, ticker, action, confidence, composite, vol_regime, reasoning) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "(timestamp, ticker, action, confidence, composite, vol_regime, "
+                " reasoning, llm_critique) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     now,
                     ticker,
@@ -581,25 +620,27 @@ class TradeJournal:
                     round(confidence, 4),
                     round(composite, 4),
                     vol_regime,
-                    reasoning[:300],
+                    reasoning[:600],
+                    llm_critique[:500],
                 ),
             )
             self._conn.commit()
 
     def get_recent_signals(self, ticker: str | None = None, limit: int = 50) -> list[dict]:
-        """Retrieve recent signals from the database."""
+        """Retrieve recent signals from the database (includes llm_critique)."""
         with self._lock:
             if ticker:
                 rows = self._conn.execute(
                     "SELECT timestamp, ticker, action, confidence, composite, "
-                    "vol_regime, reasoning FROM signals "
+                    "vol_regime, reasoning, llm_critique FROM signals "
                     "WHERE ticker = ? ORDER BY id DESC LIMIT ?",
                     (ticker, limit),
                 ).fetchall()
             else:
                 rows = self._conn.execute(
                     "SELECT timestamp, ticker, action, confidence, composite, "
-                    "vol_regime, reasoning FROM signals ORDER BY id DESC LIMIT ?",
+                    "vol_regime, reasoning, llm_critique FROM signals "
+                    "ORDER BY id DESC LIMIT ?",
                     (limit,),
                 ).fetchall()
         return [
@@ -611,6 +652,7 @@ class TradeJournal:
                 "composite": r[4],
                 "vol_regime": r[5],
                 "reasoning": r[6],
+                "llm_critique": r[7],
             }
             for r in reversed(rows)
         ]

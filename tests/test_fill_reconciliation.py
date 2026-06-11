@@ -380,7 +380,7 @@ class TestReconcileFills:
             },
         ]
 
-        from main import _reconcile_fills
+        from order_executor import reconcile_fills as _reconcile_fills
 
         mock_notifier = MagicMock()
         _reconcile_fills(
@@ -433,7 +433,7 @@ class TestReconcileFills:
             },
         ]
 
-        from main import _reconcile_fills
+        from order_executor import reconcile_fills as _reconcile_fills
 
         mock_notifier = MagicMock()
         _reconcile_fills(
@@ -464,7 +464,7 @@ class TestReconcileFills:
             },
         ]
 
-        from main import _reconcile_fills
+        from order_executor import reconcile_fills as _reconcile_fills
 
         mock_notifier = MagicMock()
         _reconcile_fills(
@@ -490,7 +490,7 @@ class TestReconcileFills:
         mock_exchange = MagicMock()
         mock_exchange.fetch_my_trades.side_effect = Exception("Connection timeout")
 
-        from main import _reconcile_fills
+        from order_executor import reconcile_fills as _reconcile_fills
 
         mock_notifier = MagicMock()
         # Should not raise
@@ -512,7 +512,7 @@ class TestReconcileFills:
             {"id": "", "side": "sell", "price": 100, "amount": 1, "cost": 100, "fee": {}},
         ]
 
-        from main import _reconcile_fills
+        from order_executor import reconcile_fills as _reconcile_fills
 
         _reconcile_fills(
             tickers=["BTC/USDC"],
@@ -565,7 +565,7 @@ class TestReconcileFills:
             },
         ]
 
-        from main import _reconcile_fills
+        from order_executor import reconcile_fills as _reconcile_fills
 
         _reconcile_fills(
             tickers=["BTC/USDC"],
@@ -600,7 +600,7 @@ class TestReconcileFills:
                 "fee": {"cost": 0.17, "currency": "USDC"},
             },
         ]
-        from main import _reconcile_fills
+        from order_executor import reconcile_fills as _reconcile_fills
 
         mock_notifier = MagicMock()
         _reconcile_fills(
@@ -647,7 +647,7 @@ class TestReconcileFills:
                 "fee": {"cost": 0.03},
             },
         ]
-        from main import _reconcile_fills
+        from order_executor import reconcile_fills as _reconcile_fills
 
         _reconcile_fills(
             tickers=["LINK/USDC"],

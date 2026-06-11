@@ -56,6 +56,11 @@ logger = logging.getLogger(__name__)
 #   Technical  0.30 → 0.35  (absorb F&G reduction — technicals should gate)
 # ---------------------------------------------------------------------------
 
+# NOTE: the numeric defaults below are mirrored in ``Settings`` in config.py.
+# A drift check at import-time (bottom of this file) asserts they stay in sync,
+# so tuning via .env cannot silently diverge from the module fallbacks used by
+# ``Strategist()`` without a ``settings`` argument.
+
 W_TECHNICAL = 0.35
 W_MOMENTUM = 0.10
 W_FORECAST = 0.05
@@ -127,7 +132,10 @@ def _parse_sentiment(sentiment: str) -> tuple[str, float]:
             return "BULLISH", normalized
         if raw_score <= 3:  # noqa: PLR2004
             return "BEARISH", normalized
-        return "NEUTRAL", normalized
+        # v9.6: the neutral band scores exactly 0. The old (raw-5.5)/4.5
+        # mapping made "NEUTRAL (Score: 5/10)" — also the LLM-failure
+        # fallback — a permanent -0.111 drag on the composite.
+        return "NEUTRAL", 0.0
 
     # Fallback: keyword matching (capped at +/-0.6 since it's less precise)
     upper = text.upper()
@@ -136,6 +144,26 @@ def _parse_sentiment(sentiment: str) -> tuple[str, float]:
     if upper.startswith("BEARISH"):
         return "BEARISH", -0.6
     return "NEUTRAL", 0.0
+
+
+# Marker substrings emitted by sentiment.py / data_pipeline.py fallback paths.
+# Matching responses carry no market information and must be excluded from the
+# composite's effective weight (same treatment as missing Polymarket data).
+_UNAVAILABLE_MARKERS = ("unavailable", "failed", "timeout")
+
+
+def _sentiment_available(text: str) -> bool:
+    """True when an LLM sentiment/consensus response carries real signal.
+
+    Failure fallbacks ("Analysis failed.", "Sentiment oracle temporarily
+    unavailable.", "Consensus unavailable.", "Timeout.") and empty strings
+    are dead weight, not neutral opinions.
+    """
+    stripped = text.strip()
+    if not stripped:
+        return False
+    lowered = stripped.lower()
+    return not any(marker in lowered for marker in _UNAVAILABLE_MARKERS)
 
 
 def _parse_consensus(consensus: str) -> tuple[str, float, float]:
@@ -476,7 +504,100 @@ class Strategist:
 
     Accepts a ``MarketData`` dataclass so that ``main.py`` builds all
     context before calling into the strategy.
+
+    Thresholds load from ``Settings`` at construction; pass ``settings=None``
+    (the default) to use the historical module-level constants.
     """
+
+    _REQUIRED_SETTINGS_FIELDS = (
+        "entry_threshold",
+        "exit_threshold",
+        "strong_sell_threshold",
+        "dca_threshold",
+        "profit_take_pct",
+        "momentum_weak_threshold",
+        "sma_overextended_pct",
+        "mean_reversion_rsi",
+        "mean_reversion_adx",
+        "mean_reversion_bonus",
+        "stale_position_hours",
+        "stale_exit_pnl_threshold_pct",
+    )
+
+    DEFAULT_WEIGHTS: "dict[str, float]" = {
+        "technical": W_TECHNICAL,
+        "momentum": W_MOMENTUM,
+        "forecast": W_FORECAST,
+        "sentiment": W_SENTIMENT,
+        "consensus": W_CONSENSUS,
+        "polymarket": W_POLYMARKET,
+        "fear_greed": W_FEAR_GREED,
+    }
+
+    def __init__(
+        self,
+        settings: object | None = None,
+        *,
+        weights_override: "dict[str, float] | None" = None,
+    ) -> None:
+        """Bind strategy thresholds from Settings (or module defaults).
+
+        ``settings`` is duck-typed: any object exposing the required fields
+        works, which keeps this module free of a top-level config import
+        (avoids a circular-import risk with tests and the backtest harness).
+        Required fields are asserted up front so a misconfigured caller
+        fails loudly at construction rather than deep inside ``generate_signal``.
+
+        ``weights_override`` lets the optimizer run trials with custom
+        composite weights. When provided, must contain the seven keys in
+        :attr:`DEFAULT_WEIGHTS` and sum to 1.0 (±1e-9).
+        """
+        if settings is None:
+            self.entry_threshold: float = _ENTRY_THRESHOLD
+            self.exit_threshold: float = _EXIT_THRESHOLD
+            self.strong_sell_threshold: float = _STRONG_SELL_THRESHOLD
+            self.dca_threshold: float = _DCA_THRESHOLD
+            self.profit_take_pct: float = _PROFIT_TAKE_PCT
+            self.momentum_weak_threshold: float = _MOMENTUM_WEAK_THRESHOLD
+            self.sma_overextended_pct: float = _SMA_OVEREXTENDED_PCT
+            self.mean_reversion_rsi: float = _MEAN_REVERSION_RSI
+            self.mean_reversion_adx: float = _MEAN_REVERSION_ADX
+            self.mean_reversion_bonus: float = _MEAN_REVERSION_BONUS
+            self.stale_position_hours: float = _STALE_POSITION_HOURS
+            self.stale_exit_pnl_threshold_pct: float = _STALE_EXIT_PNL_THRESHOLD_PCT
+            self.require_bullish_sentiment: bool = False
+        else:
+            missing = [f for f in self._REQUIRED_SETTINGS_FIELDS if not hasattr(settings, f)]
+            assert not missing, f"Strategist settings missing fields: {missing}"  # noqa: S101
+
+            self.entry_threshold = settings.entry_threshold
+            self.exit_threshold = settings.exit_threshold
+            self.strong_sell_threshold = settings.strong_sell_threshold
+            self.dca_threshold = settings.dca_threshold
+            self.profit_take_pct = settings.profit_take_pct
+            self.momentum_weak_threshold = settings.momentum_weak_threshold
+            self.sma_overextended_pct = settings.sma_overextended_pct
+            self.mean_reversion_rsi = settings.mean_reversion_rsi
+            self.mean_reversion_adx = settings.mean_reversion_adx
+            self.mean_reversion_bonus = settings.mean_reversion_bonus
+            self.stale_position_hours = settings.stale_position_hours
+            self.stale_exit_pnl_threshold_pct = settings.stale_exit_pnl_threshold_pct
+            # getattr: duck-typed settings from the optimizer/backtest harness
+            # predate v9.6 and may not carry the gate-mode flag.
+            self.require_bullish_sentiment = bool(
+                getattr(settings, "require_bullish_sentiment", False),
+            )
+
+        if weights_override is None:
+            self._weights = dict(self.DEFAULT_WEIGHTS)
+        else:
+            missing_w = set(self.DEFAULT_WEIGHTS) - set(weights_override)
+            assert not missing_w, f"weights_override missing keys: {sorted(missing_w)}"  # noqa: S101
+            total = sum(weights_override.values())
+            assert abs(total - 1.0) < 1e-9, (  # noqa: S101
+                f"weights_override must sum to 1.0, got {total}"
+            )
+            self._weights = dict(weights_override)
 
     def generate_signal(self, data: MarketData) -> TradeSignal:
         """Score all data algorithmically and issue a BUY / SELL / HOLD signal."""
@@ -520,25 +641,31 @@ class Strategist:
         # Fear & Greed missing), its weight is excluded from the denominator
         # so the remaining signals aren't diluted by dead weight.
         # ---------------------------------------------------------------
-        raw_sum = (
-            W_TECHNICAL * technical_score
-            + W_MOMENTUM * momentum_score
-            + W_SENTIMENT * sentiment_score
-            + W_CONSENSUS * consensus_score
-        )
-        effective_weight = W_TECHNICAL + W_MOMENTUM + W_SENTIMENT + W_CONSENSUS
+        w = self._weights
+        raw_sum = w["technical"] * technical_score + w["momentum"] * momentum_score
+        effective_weight = w["technical"] + w["momentum"]
+
+        # v9.6: LLM failure fallbacks are dead weight, not neutral opinions —
+        # exclude them from the denominator like missing Polymarket data.
+        if _sentiment_available(data.sentiment):
+            raw_sum += w["sentiment"] * sentiment_score
+            effective_weight += w["sentiment"]
+
+        if _sentiment_available(data.consensus):
+            raw_sum += w["consensus"] * consensus_score
+            effective_weight += w["consensus"]
 
         if has_forecast:
-            raw_sum += W_FORECAST * forecast_score
-            effective_weight += W_FORECAST
+            raw_sum += w["forecast"] * forecast_score
+            effective_weight += w["forecast"]
 
         if has_polymarket:
-            raw_sum += W_POLYMARKET * polymarket_score
-            effective_weight += W_POLYMARKET
+            raw_sum += w["polymarket"] * polymarket_score
+            effective_weight += w["polymarket"]
 
         if has_fear_greed:
-            raw_sum += W_FEAR_GREED * fear_greed_score
-            effective_weight += W_FEAR_GREED
+            raw_sum += w["fear_greed"] * fear_greed_score
+            effective_weight += w["fear_greed"]
 
         assert effective_weight > 0, f"Effective weight must be positive, got {effective_weight}"  # noqa: S101
         composite = raw_sum / effective_weight
@@ -572,12 +699,12 @@ class Strategist:
         if (
             data.regime == _MR.RANGING
             and rsi is not None
-            and rsi < _MEAN_REVERSION_RSI
+            and rsi < self.mean_reversion_rsi
             and adx is not None
-            and adx < _MEAN_REVERSION_ADX
+            and adx < self.mean_reversion_adx
             and volatility_regime != "EXTREME"
         ):
-            composite += _MEAN_REVERSION_BONUS
+            composite += self.mean_reversion_bonus
             reasons.append("mean-reversion(oversold+weak-trend+RANGING)")
 
         # Regime modifier
@@ -594,6 +721,17 @@ class Strategist:
         vol_gate, vol_reason = _compute_volatility_penalty(volatility_regime)
         if vol_reason:
             reasons.append(vol_reason)
+
+        # Machine-readable component-score token — consumed by
+        # ``signal_analytics.factor_attribution`` via regex so the per-factor
+        # correlation with trade P&L can be computed post-hoc. Keep the exact
+        # ``key=+0.000`` format; the parser's regex is anchored to it.
+        reasons.append(
+            f"tech={technical_score:+.3f} mom={momentum_score:+.3f} "
+            f"fc={forecast_score:+.3f} sent={sentiment_score:+.3f} "
+            f"cons={consensus_score:+.3f} poly={polymarket_score:+.3f} "
+            f"fg={fear_greed_score:+.3f}",
+        )
 
         raw_confidence = min(abs(composite), 1.0)
 
@@ -616,7 +754,7 @@ class Strategist:
         )
 
         # Compute regime-adjusted entry threshold
-        effective_entry_threshold = _ENTRY_THRESHOLD
+        effective_entry_threshold = self.entry_threshold
         if data.regime is not None:
             from regime import RegimeClassifier
 
@@ -666,8 +804,8 @@ class Strategist:
     # Private decision helpers
     # ------------------------------------------------------------------
 
-    @staticmethod
     def _entry_signal(  # noqa: PLR0913
+        self,
         composite: float,
         raw_confidence: float,
         vol_gate: float,
@@ -679,12 +817,14 @@ class Strategist:
         sma_7_deviation_pct: float | None,
         reasons: list[str],
         current_price: float,
-        entry_threshold: float = _ENTRY_THRESHOLD,
+        entry_threshold: float | None = None,
         *,
         technical_score: float = 0.0,
         multi_tf: "MultiTimeframeContext | None" = None,
     ) -> TradeSignal:
         """Entry logic: BUY or HOLD."""
+        if entry_threshold is None:
+            entry_threshold = self.entry_threshold
         assert -1.0 <= technical_score <= 1.0, (  # noqa: S101
             f"technical_score out of range: {technical_score}"
         )
@@ -693,18 +833,27 @@ class Strategist:
                 f"Unexpected trend_bias: {multi_tf.trend_bias}"
             )
 
-        # Require bullish sentiment or strong upward consensus to enter.
-        sentiment_gate = (
-            (sentiment_direction == "BULLISH")
-            or (consensus_direction == "UP" and consensus_probability > 60)  # noqa: PLR2004
-        )
+        if self.require_bullish_sentiment:
+            # Legacy hard gate: the LLM must actively confirm the entry.
+            # Disables ALL entries whenever the sentiment provider is degraded
+            # (the 2026-05/06 seven-week silence). Opt-in via Settings.
+            sentiment_gate = (
+                (sentiment_direction == "BULLISH")
+                or (consensus_direction == "UP" and consensus_probability > 60)  # noqa: PLR2004
+            )
+        else:
+            # v9.6 advisory mode: sentiment can veto, never authorize —
+            # block only on BEARISH sentiment or a strong DOWN consensus.
+            sentiment_gate = sentiment_direction != "BEARISH" and not (
+                consensus_direction == "DOWN" and consensus_probability > 60  # noqa: PLR2004
+            )
 
         # Block entry when RSI signals overbought.
         rsi_gate = rsi is None or rsi <= 70  # noqa: PLR2004
 
         # Block entry when price is too far above SMA (overextended rally).
         sma_concern = (
-            sma_7_deviation_pct is not None and sma_7_deviation_pct > _SMA_OVEREXTENDED_PCT
+            sma_7_deviation_pct is not None and sma_7_deviation_pct > self.sma_overextended_pct
         )
 
         # v8.1: Block entry when technicals are negative (sentiment overriding bearish price action).
@@ -753,7 +902,9 @@ class Strategist:
         if not rsi_gate:
             blockers.append("RSI overbought (>70)")
         if sma_concern:
-            blockers.append(f"SMA deviation +{sma_7_deviation_pct:.1f}% > {_SMA_OVEREXTENDED_PCT}%")
+            blockers.append(
+                f"SMA deviation +{sma_7_deviation_pct:.1f}% > {self.sma_overextended_pct}%",
+            )
         if composite <= entry_threshold:
             blockers.append(f"composite too low ({composite:+.3f})")
         if not technical_gate:
@@ -768,8 +919,8 @@ class Strategist:
             reasoning=f"HOLD: {', '.join(blockers)}. {', '.join(reasons)}",
         )
 
-    @staticmethod
     def _exit_signal(  # noqa: PLR0913, PLR0911
+        self,
         composite: float,
         raw_confidence: float,
         vol_gate: float,
@@ -786,8 +937,8 @@ class Strategist:
         position_age = data.position_age_hours
         if (
             position_age is not None
-            and position_age > _STALE_POSITION_HOURS
-            and abs(pnl_pct) < _STALE_EXIT_PNL_THRESHOLD_PCT
+            and position_age > self.stale_position_hours
+            and abs(pnl_pct) < self.stale_exit_pnl_threshold_pct
         ):
             return TradeSignal(
                 action="SELL",
@@ -801,7 +952,7 @@ class Strategist:
             )
 
         # SELL if sentiment turned BEARISH and composite confirms.
-        if sentiment_direction == "BEARISH" and composite < _EXIT_THRESHOLD:
+        if sentiment_direction == "BEARISH" and composite < self.exit_threshold:
             return TradeSignal(
                 action="SELL",
                 confidence=min(abs(composite) + 0.1, 1.0),
@@ -812,8 +963,8 @@ class Strategist:
                 ),
             )
 
-        # SELL if profit >5% with weakening momentum — lock in gains.
-        if pnl_pct > _PROFIT_TAKE_PCT and composite < _MOMENTUM_WEAK_THRESHOLD:
+        # SELL if profit exceeds profit_take_pct with weakening momentum — lock in gains.
+        if pnl_pct > self.profit_take_pct and composite < self.momentum_weak_threshold:
             return TradeSignal(
                 action="SELL",
                 confidence=0.7,
@@ -825,7 +976,7 @@ class Strategist:
             )
 
         # Strong negative composite — cut losses.
-        if composite < _STRONG_SELL_THRESHOLD:
+        if composite < self.strong_sell_threshold:
             return TradeSignal(
                 action="SELL",
                 confidence=min(abs(composite), 1.0),
@@ -834,7 +985,7 @@ class Strategist:
             )
 
         # DCA opportunity — strong bullish signal on existing position.
-        if composite > _DCA_THRESHOLD:
+        if composite > self.dca_threshold:
             confidence = raw_confidence
             if vol_gate > 0 and confidence <= vol_gate:
                 return TradeSignal(
@@ -863,3 +1014,41 @@ class Strategist:
             composite=composite,
             reasoning=(f"Position maintained (composite={composite:+.3f}). {', '.join(reasons)}"),
         )
+
+
+def _assert_module_defaults_match_settings() -> None:
+    """Fail at import time if strategy module constants drift from Settings defaults.
+
+    Two sources of truth is bad; we allow it only because tests and the
+    backtest harness instantiate ``Strategist()`` without a settings
+    argument.  This check makes any drift loud instead of silent.
+    """
+    from config import Settings
+
+    fields = Settings.model_fields
+    expected = {
+        "entry_threshold": _ENTRY_THRESHOLD,
+        "exit_threshold": _EXIT_THRESHOLD,
+        "strong_sell_threshold": _STRONG_SELL_THRESHOLD,
+        "dca_threshold": _DCA_THRESHOLD,
+        "profit_take_pct": _PROFIT_TAKE_PCT,
+        "momentum_weak_threshold": _MOMENTUM_WEAK_THRESHOLD,
+        "sma_overextended_pct": _SMA_OVEREXTENDED_PCT,
+        "mean_reversion_rsi": float(_MEAN_REVERSION_RSI),
+        "mean_reversion_adx": float(_MEAN_REVERSION_ADX),
+        "mean_reversion_bonus": _MEAN_REVERSION_BONUS,
+        "stale_position_hours": float(_STALE_POSITION_HOURS),
+        "stale_exit_pnl_threshold_pct": _STALE_EXIT_PNL_THRESHOLD_PCT,
+    }
+    drifted = [
+        name
+        for name, module_val in expected.items()
+        if abs(fields[name].default - module_val) > 1e-9
+    ]
+    assert not drifted, (  # noqa: S101
+        f"strategy.py module constants drift from Settings defaults: {drifted}. "
+        "Update one to match the other."
+    )
+
+
+_assert_module_defaults_match_settings()
