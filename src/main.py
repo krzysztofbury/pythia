@@ -22,7 +22,7 @@ from llm_challenger import LLMChallenger
 from notifier import NullNotifier, WebhookNotifier
 from order_executor import reconcile_fills, reconcile_stale_orders
 from paper_portfolio import PaperPortfolio
-from portfolio_manager import classify_tickers
+from portfolio_manager import classify_tickers, compute_available_slots
 from risk_guardian import RiskGuardian, check_daily_loss_limit
 from sentiment import SentimentOracle
 from strategy import Strategist

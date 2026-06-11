@@ -505,3 +505,14 @@ class TestEntryDroughtAlert:
         settings.no_entry_alert_hours = 0.0
         notifier = MagicMock()
         assert check_entry_drought(journal, settings, notifier, _state={}) is False
+
+
+class TestRunCycleNamesResolve:
+    def test_main_imports_compute_available_slots(self):
+        """Regression: an autofixer once stripped this import because it was
+        added one edit before its usage — run_cycle then crashed at runtime
+        with NameError while every test stayed green."""
+        import main
+
+        assert hasattr(main, "compute_available_slots")
+        assert hasattr(main, "classify_tickers")
