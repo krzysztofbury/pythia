@@ -186,6 +186,12 @@ class LLMClient:
         """Execute a single litellm completion; pull text out of the response."""
         import litellm
 
+        # Quiet litellm's console chatter: per-call INFO lines and the
+        # "Give Feedback / Get Help" banners drown the trading log.
+        # Idempotent — cheap to set on every call.
+        litellm.suppress_debug_info = True
+        logging.getLogger("LiteLLM").setLevel(logging.WARNING)
+
         kwargs: dict = {
             "model": model,
             "messages": messages,
