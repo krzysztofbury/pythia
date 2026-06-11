@@ -345,3 +345,91 @@ class TestFillDedupWindow:
             "SELECT COUNT(*) FROM trades WHERE side='SELL'",
         ).fetchone()[0]
         assert count == 1
+
+
+# ---------------------------------------------------------------------------
+# Zeno review findings (v9.7 follow-up)
+# ---------------------------------------------------------------------------
+
+
+class TestOptimizerWeightKeysComplete:
+    def test_weight_keys_match_default_weights(self):
+        """#1 CRITICAL: validate()/walk_forward rebuild weights from
+        _WEIGHT_KEYS — a missing key crashes Strategist's override guard."""
+        from optimizer import _WEIGHT_KEYS
+
+        assert set(_WEIGHT_KEYS) == set(Strategist.DEFAULT_WEIGHTS)
+
+
+class TestFillDedupScopedToPlacements:
+    def test_exchange_fill_does_not_suppress_second_exchange_fill(self, journal):
+        """#2 HIGH: two genuine same-size exchange fills within the window
+        must both be journaled — dedup only targets bot placement rows."""
+        from order_executor import _process_single_fill
+
+        _process_single_fill(
+            _fill("FILL-A", "buy", 9.50, 2.0),
+            "LINK/USDC",
+            journal,
+            MagicMock(),
+            "USDC",
+            0.19,
+        )
+        _process_single_fill(
+            _fill("FILL-B", "buy", 9.50, 2.0),
+            "LINK/USDC",
+            journal,
+            MagicMock(),
+            "USDC",
+            0.19,
+        )
+        count = journal._conn.execute(  # noqa: SLF001
+            "SELECT COUNT(*) FROM trades WHERE side='BUY'",
+        ).fetchone()[0]
+        assert count == 2
+
+
+class TestParseFundingNonFinite:
+    @pytest.mark.parametrize("rate", [float("nan"), float("inf"), float("-inf")])
+    def test_non_finite_rates_are_unavailable(self, rate):
+        """#3 MEDIUM: NaN/inf must not inject a max-conviction signal."""
+        score, has_data = _parse_funding(rate)
+        assert score == 0.0
+        assert has_data is False
+
+
+class TestRoundUpRespectsConcentrationCap:
+    def test_no_bump_when_min_order_exceeds_concentration_cap(self):
+        """#4 MEDIUM: a depleted account must not breach the 40% cap via
+        the $10 round-up (balance $20 -> cap $8 -> reject, not $10)."""
+        from unittest.mock import patch
+
+        from risk_guardian import RiskGuardian
+
+        env = {"KRAKEN_API_KEY": "test", "KRAKEN_PRIVATE_KEY": "test"}
+        with patch.dict("os.environ", env, clear=False):
+            from config import Settings
+
+            settings = Settings()
+        settings.max_position_size_usd = 50.0
+        exchange = MagicMock()
+        exchange.get_free_balance.return_value = 20.0
+        guardian = RiskGuardian(settings, exchange)
+        amount = guardian.check_buy(
+            "BTC/USDC",
+            price=50_000.0,
+            trade_signal=_make_buy_signal_local(0.30),
+            available_slots=1,
+        )
+        assert amount == 0.0
+
+
+def _make_buy_signal_local(composite: float):
+    from models import TradeSignal
+
+    return TradeSignal(
+        action="BUY",
+        confidence=abs(composite),
+        composite=composite,
+        reasoning="test",
+    )

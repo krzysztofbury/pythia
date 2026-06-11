@@ -19,6 +19,9 @@ import sys
 logger = logging.getLogger(__name__)
 
 
+# Must stay in sync with Strategist.DEFAULT_WEIGHTS — validate()/walk_forward
+# rebuild override dicts from these keys and the Strategist constructor
+# asserts completeness.
 _WEIGHT_KEYS = (
     "technical",
     "momentum",
@@ -27,6 +30,7 @@ _WEIGHT_KEYS = (
     "consensus",
     "polymarket",
     "fear_greed",
+    "funding",
 )
 
 

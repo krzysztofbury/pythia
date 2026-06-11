@@ -32,6 +32,7 @@ v8.2 — Post-analysis tuning (April 2026):
 """
 
 import logging
+import math
 import re
 
 from models import MarketData, TradeSignal
@@ -204,7 +205,9 @@ def _parse_funding(funding_rate: float | None) -> tuple[float, bool]:
     Contrarian sign convention: negative funding (shorts paying longs,
     crowded short positioning) scores bullish; positive funding bearish.
     """
-    if funding_rate is None:
+    if funding_rate is None or not math.isfinite(funding_rate):
+        # NaN poisons min/max into returning +1.0 — a max-conviction signal
+        # fabricated from garbage. Non-finite means no data.
         return 0.0, False
     score = -funding_rate / _FUNDING_EXTREME_RATE
     return max(-1.0, min(1.0, score)), True

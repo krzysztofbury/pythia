@@ -540,7 +540,13 @@ def _process_single_fill(
     # v9.7: window widened 15 -> 180 min. Maker orders live up to 2h before
     # stale-order cleanup; fills landing after 15 min were re-journaled on
     # top of the placement row, double-counting the position.
-    if journal.has_recent_trade(ticker, side, fill_qty, window_minutes=FILL_DEDUP_WINDOW_MINUTES):
+    if journal.has_recent_trade(
+        ticker,
+        side,
+        fill_qty,
+        window_minutes=FILL_DEDUP_WINDOW_MINUTES,
+        fill_source="bot",
+    ):
         return
 
     profit = 0.0

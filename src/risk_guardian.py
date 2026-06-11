@@ -235,7 +235,13 @@ class RiskGuardian:
             # Round up to the exchange minimum only when balance AND the
             # intra-cycle budget can actually cover the bumped order.
             spendable = total_balance if budget_usd is None else min(total_balance, budget_usd)
-            if ROUND_UP_THRESHOLD <= target_usd < MIN_ORDER_USD <= spendable:
+            # The bump must never breach the concentration cap — on a depleted
+            # account (balance < MIN_ORDER/max_pct) rounding up would put >40%
+            # of the book into one position.
+            if (
+                ROUND_UP_THRESHOLD <= target_usd < MIN_ORDER_USD <= spendable
+                and MIN_ORDER_USD <= concentration_cap
+            ):
                 logger.info(
                     "Guardian: Rounding up %s to $%s for Kraken.",
                     target_usd,

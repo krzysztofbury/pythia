@@ -31,6 +31,21 @@ The format is loosely based on [Keep a Changelog](https://keepachangelog.com/en/
   the composite's effective weight (observed live: Gemini/Grok answer
   "Insufficient recent data available" when they cannot browse).
 
+### Fixed (post-release review — Zeno pair-programmer pass)
+
+- **CRITICAL**: optimizer `_WEIGHT_KEYS` was missing `funding` — `validate()`
+  silently returned an error dict and walk-forward runs crashed when
+  rebuilding weights from the best trial.
+- **HIGH**: fill-reconciliation dedup scoped to bot placement rows
+  (`fill_source='bot'`) — with the 180-min window, two genuine same-size
+  exchange fills could have suppressed each other (exchange fills are already
+  idempotent by fill id).
+- **MEDIUM**: `_parse_funding` rejects NaN/±inf (NaN poisoned min/max into a
+  fabricated max-bullish +1.0 score); `FundingRateFetcher` also rejects
+  non-finite rates at the source.
+- **MEDIUM**: the $10 round-up no longer breaches the concentration cap on
+  depleted accounts (balance < MIN_ORDER/max_pct → reject, not oversize).
+
 ---
 
 ## [9.6.0] — 2026-06-11

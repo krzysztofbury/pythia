@@ -9,6 +9,7 @@ cannot block trading.
 from __future__ import annotations
 
 import logging
+import math
 
 logger = logging.getLogger(__name__)
 
@@ -70,9 +71,12 @@ class FundingRateFetcher:
         if rate is None:
             return None
         try:
-            return float(rate)
+            value = float(rate)
         except (TypeError, ValueError):
             return None
+        if not math.isfinite(value):
+            return None
+        return value
 
     @staticmethod
     def _to_perp(spot_symbol: str) -> str:

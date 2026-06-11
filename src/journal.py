@@ -346,20 +346,26 @@ class TradeJournal:
         side: str,
         quantity: float,
         window_minutes: int = 15,
+        fill_source: str | None = None,
     ) -> bool:
         """Check if a similar trade was recorded recently (to avoid duplicates).
 
         Matches by ticker + side + quantity within +/-5% + time window.
+        ``fill_source`` narrows the match (v9.7: reconciliation dedups fills
+        against bot placement rows only, so two genuine same-size exchange
+        fills cannot suppress each other — those are deduped by fill id).
         """
         cutoff = (
             datetime.datetime.now(tz=datetime.timezone.utc)
             - datetime.timedelta(minutes=window_minutes)
         ).isoformat()
+        query = "SELECT quantity FROM trades WHERE instrument = ? AND side = ? AND timestamp > ?"
+        params: list = [ticker, side, cutoff]
+        if fill_source is not None:
+            query += " AND fill_source = ?"
+            params.append(fill_source)
         with self._lock:
-            rows = self._conn.execute(
-                "SELECT quantity FROM trades WHERE instrument = ? AND side = ? AND timestamp > ?",
-                (ticker, side, cutoff),
-            ).fetchall()
+            rows = self._conn.execute(query, params).fetchall()
         for (qty,) in rows:
             if abs(qty - quantity) / max(quantity, 1e-12) < 0.05:  # within 5%  # noqa: PLR2004
                 return True

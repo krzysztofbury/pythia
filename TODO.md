@@ -21,6 +21,12 @@ Forward-looking work. For what's already shipped see [CHANGELOG.md](CHANGELOG.md
 
 ---
 
+## 1b. Order-identity fill reconciliation
+
+**Why (Zeno review 2026-06-11):** fills are deduped against bot placement rows by fuzzy ticker+side+qty(±5%)+180min matching. Robust fix: capture the exchange order id at `place_maker_buy`/`place_maker_sell` time, journal it on the placement row, and reconcile fills by updating that row instead of inserting — removes both double-count and false-dedup classes entirely.
+
+---
+
 ## 2. HMM-Based Regime Detection
 
 **Why:** Rule-based regime detection (ADX + EMA + ROC) uses hard thresholds. Hidden Markov Models learn regime transitions from data and adapt to changing market dynamics.
