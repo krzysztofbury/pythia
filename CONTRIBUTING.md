@@ -5,7 +5,7 @@ Thank you for your interest in contributing to Oracle Pythia.
 ## Getting Started
 
 1. Fork the repository
-2. Clone your fork: `git clone https://github.com/<your-user>/oracle-pythia.git`
+2. Clone your fork: `git clone https://github.com/<your-user>/pythia.git`
 3. Install [uv](https://docs.astral.sh/uv/): `curl -LsSf https://astral.sh/uv/install.sh | sh`
 4. Install dependencies: `uv sync`
 5. Copy `.env.example` to `.env` and configure (PAPER mode for development)

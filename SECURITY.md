@@ -4,10 +4,10 @@
 
 | Version | Supported |
 |---------|-----------|
-| 9.5.x   | Yes       |
-| 9.0.x – 9.4.x | Yes |
-| 8.x     | No — upgrade to 9.5 |
-| < 8.0   | No        |
+| 9.7.x   | Yes       |
+| 9.6.x   | Yes       |
+| 9.0.x – 9.5.x | No — upgrade to 9.7 (v9.6 fixed a fail-closed entry gate) |
+| < 9.0   | No        |
 
 ## Reporting a Vulnerability
 
@@ -26,7 +26,7 @@ Oracle Pythia handles sensitive financial data and API credentials:
 - All API keys are loaded from `.env` files using `pydantic.SecretStr`
 - Keys are never logged, printed, or included in error messages. v9.1's `llm_client._sanitize` additionally scrubs anything resembling an API key from LLM error strings before they hit the log file or Discord webhook.
 - Kraken API keys should be configured with **minimal permissions**: Query Funds + Modify Orders only. **Never enable Withdrawal permissions.**
-- Optional LLM provider keys (Anthropic, Gemini, OpenAI) are only needed when the LLM Challenger is enabled (`CHALLENGER_ENABLED=true`). All provider HTTP calls go through LiteLLM, which is configured for read-only completions.
+- The primary sentiment model (v9.6+: Gemini via `SENTIMENT_MODEL`) requires its provider key (`GEMINI_API_KEY` by default). Other provider keys (Anthropic, OpenAI, xAI) are needed only for the configured fallback or the LLM Challenger. All provider HTTP calls go through LiteLLM, which is configured for read-only completions; the LLM never issues trade instructions.
 
 ### Database
 - `trades.db` contains full trading history including prices, quantities, and P&L

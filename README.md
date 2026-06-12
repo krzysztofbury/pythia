@@ -359,8 +359,8 @@ Only Polymarket API calls route through the WARP proxy. All other traffic (Krake
 
 ```bash
 # 1. Clone the repo
-git clone https://github.com/your-user/oracle-pythia.git
-cd oracle-pythia
+git clone https://github.com/krzysztofbury/pythia.git
+cd pythia
 
 # 2. Configure environment
 cp .env.example .env
@@ -389,8 +389,8 @@ docker compose restart oracle-pythia
 #### 1. Clone and Configure
 
 ```bash
-git clone https://github.com/your-user/oracle-pythia.git
-cd oracle-pythia
+git clone https://github.com/krzysztofbury/pythia.git
+cd pythia
 cp .env.example .env
 ```
 
