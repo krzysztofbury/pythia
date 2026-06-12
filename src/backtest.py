@@ -24,12 +24,17 @@ class BacktestResult:
     win_rate_pct: float
     buy_and_hold_return_pct: float
     num_trades: int
+    sortino_ratio: float = 0.0
+    calmar_ratio: float = 0.0
+    profit_factor: float = 0.0
 
     def summary(self) -> str:
         """Human-readable summary."""
         return (
             f"Return: {self.total_return_pct:+.2f}% | "
             f"Sharpe: {self.sharpe_ratio:.2f} | "
+            f"Sortino: {self.sortino_ratio:.2f} | "
+            f"Calmar: {self.calmar_ratio:.2f} | "
             f"MaxDD: {self.max_drawdown_pct:.2f}% | "
             f"Win Rate: {self.win_rate_pct:.1f}% | "
             f"Trades: {self.num_trades} | "
@@ -82,11 +87,17 @@ class CompositeStrategy(Strategy):
     """Backtest strategy that uses the actual Strategist composite scorer.
 
     Builds a MarketData from bar data and calls Strategist.generate_signal().
+
+    Optimizer hook: set the class attribute ``_strategist_factory`` to a
+    zero-arg callable returning a :class:`Strategist` configured with the
+    weights / thresholds being evaluated. ``init()`` uses the factory when
+    set; otherwise it falls back to ``Strategist()`` with module defaults.
     """
 
     ticker = "BTC/USDT"
     snapshots: list = []  # Historical market snapshots for realistic backtesting
     _snapshot_idx: int = 0
+    _strategist_factory = None  # Callable[[], Strategist] | None
 
     def init(self) -> None:
         """Initialize the composite scorer components."""
@@ -116,7 +127,8 @@ class CompositeStrategy(Strategy):
         sma_ind = SMAIndicator(close=close_series, window=7)
         self.sma7 = self.I(lambda: sma_ind.sma_indicator().to_numpy(), name="SMA7")
 
-        self._strategist = Strategist()
+        factory = type(self)._strategist_factory
+        self._strategist = factory() if factory is not None else Strategist()
 
     def next(self) -> None:
         """Build MarketData from current bar and call Strategist."""
@@ -237,6 +249,9 @@ class BacktestRunner:
             win_rate_pct=float(stats.get("Win Rate [%]", 0.0) or 0.0),
             buy_and_hold_return_pct=float(buy_hold_return),
             num_trades=int(stats.get("# Trades", 0)),
+            sortino_ratio=float(stats.get("Sortino Ratio", 0.0) or 0.0),
+            calmar_ratio=float(stats.get("Calmar Ratio", 0.0) or 0.0),
+            profit_factor=float(stats.get("Profit Factor", 0.0) or 0.0),
         )
 
     def run_from_exchange(
@@ -267,10 +282,14 @@ def main() -> None:
 
     parser = argparse.ArgumentParser(description="Run backtests")
     parser.add_argument(
-        "--use-snapshots", action="store_true", help="Load historical snapshots from journal"
+        "--use-snapshots",
+        action="store_true",
+        help="Load historical snapshots from journal",
     )
     parser.add_argument(
-        "--ticker", default=None, help="Single ticker to backtest (default: all universe)"
+        "--ticker",
+        default=None,
+        help="Single ticker to backtest (default: all universe)",
     )
     args = parser.parse_args()
 

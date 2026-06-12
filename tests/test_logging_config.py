@@ -33,7 +33,7 @@ class TestLogRetentionConfig:
     def test_default_retention_days(self):
         with patch.dict("os.environ", _ENV):
             settings = Settings()
-        assert settings.log_retention_days == 7
+        assert settings.log_retention_days == 30  # noqa: PLR2004  # v9.6: 7 destroyed incident evidence
 
     def test_custom_retention_days(self):
         with patch.dict("os.environ", {**_ENV, "LOG_RETENTION_DAYS": "14"}):

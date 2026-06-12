@@ -1,6 +1,6 @@
 [project]
 name = "oracle-pythia"
-version = "8.2.0"
+version = "9.5.0"
 description = "Autonomous crypto trading bot on Kraken with algorithmic strategy, Grok sentiment, Polymarket odds, and quantitative analysis."
 readme = "README.md"
 requires-python = ">=3.13"
@@ -21,6 +21,7 @@ dependencies = [
     "pmdarima>=2.0.4",
     "PySocks>=1.7.1",
     "optuna>=4.0.0",
+    "litellm>=1.52.0",
 ]
 
 [tool.setuptools.package-dir]

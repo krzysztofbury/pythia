@@ -117,3 +117,7 @@ class MarketData:
     # Multi-timeframe and regime context
     multi_tf: MultiTimeframeContext | None = None
     regime: MarketRegime | None = None
+
+    # v9.5: perp funding rate from secondary exchange (informational; not yet
+    # fed into composite). Negative = shorts paying longs (contrarian bullish).
+    funding_rate: float | None = None

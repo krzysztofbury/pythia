@@ -1,9 +1,10 @@
-"""Sentiment analysis using Grok and Polymarket."""
+"""Sentiment analysis using LiteLLM-backed chat models and Polymarket."""
 
 import json
 import logging
 import re
 import threading
+import time
 
 import requests
 from pydantic import SecretStr
@@ -13,57 +14,84 @@ from tenacity import (
     stop_after_attempt,
     wait_exponential,
 )
-from xai_sdk import Client
-from xai_sdk.chat import system, user
+
+from llm_client import LLMClient
 
 logger = logging.getLogger(__name__)
 
 GAMMA_API_BASE = "https://gamma-api.polymarket.com"
 
-# Circuit breaker: skip Grok for N cycles after consecutive failures
-_MAX_CONSECUTIVE_FAILURES = 3
-
 
 class SentimentOracle:
-    """Oracle for fetching market sentiment and predictions."""
+    """Oracle for fetching market sentiment and predictions.
+
+    LLM calls route through :class:`LLMClient` (LiteLLM-backed); any provider
+    LiteLLM supports is available by switching ``model_name``. Legacy bare
+    model strings (e.g. ``grok-4-1-fast-reasoning``) are auto-prefixed with
+    ``xai/`` to keep the old ``.env`` working without edits.
+    """
 
     def __init__(
         self,
-        xai_key: SecretStr,
+        xai_key: SecretStr | None,
         model_name: str,
         cmc_key: SecretStr | None = None,
         warp_proxy: str | None = None,
+        *,
+        fallback_model: str | None = None,
+        extra_api_keys: dict[str, str] | None = None,
+        cache_ttl_seconds: float = 0.0,
     ) -> None:
-        """Initialize the Grok, CMC, and Polymarket clients."""
-        self._grok = Client(api_key=xai_key.get_secret_value())
-        self._model_name = model_name
+        """Build the LLM client + HTTP session state.
+
+        ``cache_ttl_seconds`` > 0 enables a per-ticker TTL cache for the
+        sentiment and consensus LLM calls. Failure fallbacks are never
+        cached, so a degraded provider is retried on the next cycle.
+        """
         self._cmc_key = cmc_key
         self._warp_proxy = warp_proxy
-        self._consecutive_failures = 0
-        self._cb_lock = threading.Lock()
+
+        resolved_model = model_name if "/" in model_name else f"xai/{model_name}"
+
+        api_keys: dict[str, str] = {}
+        if xai_key is not None:
+            api_keys["xai"] = xai_key.get_secret_value()
+        if extra_api_keys:
+            api_keys.update(extra_api_keys)
+
+        self._llm = LLMClient(
+            primary_model=resolved_model,
+            fallback_model=fallback_model,
+            api_keys=api_keys,
+            max_tokens=512,
+            timeout=30.0,
+        )
+
+        assert cache_ttl_seconds >= 0, f"cache_ttl_seconds must be >= 0: {cache_ttl_seconds}"  # noqa: S101
+        self._cache_ttl = cache_ttl_seconds
+        self._cache: dict[str, tuple[float, str]] = {}
+        self._cache_lock = threading.Lock()
+
+    def _cache_get(self, key: str) -> str | None:
+        """Return a cached LLM response if present and fresh."""
+        if self._cache_ttl <= 0:
+            return None
+        with self._cache_lock:
+            entry = self._cache.get(key)
+            if entry is not None and (time.monotonic() - entry[0]) < self._cache_ttl:
+                return entry[1]
+        return None
+
+    def _cache_put(self, key: str, value: str) -> None:
+        """Store a successful LLM response."""
+        if self._cache_ttl <= 0:
+            return
+        with self._cache_lock:
+            self._cache[key] = (time.monotonic(), value)
 
     def _is_circuit_open(self) -> bool:
-        """Check if the Grok circuit breaker is open (too many failures)."""
-        with self._cb_lock:
-            return self._consecutive_failures >= _MAX_CONSECUTIVE_FAILURES
-
-    def _record_success(self) -> None:
-        """Record a successful Grok call, resetting the circuit breaker."""
-        with self._cb_lock:
-            if self._consecutive_failures > 0:
-                logger.info("Grok circuit breaker reset after success.")
-            self._consecutive_failures = 0
-
-    def _record_failure(self) -> None:
-        """Record a failed Grok call, potentially opening the circuit breaker."""
-        with self._cb_lock:
-            self._consecutive_failures += 1
-            if self._consecutive_failures >= _MAX_CONSECUTIVE_FAILURES:
-                logger.warning(
-                    "Grok circuit breaker OPEN: %d consecutive failures. "
-                    "Skipping Grok calls until next successful attempt.",
-                    self._consecutive_failures,
-                )
+        """Expose the underlying LLM circuit-breaker state for callers."""
+        return self._llm.is_circuit_open()
 
     def get_fear_and_greed_index(self) -> str:
         """Fetch the latest Crypto Fear & Greed Index from CoinMarketCap."""
@@ -90,53 +118,44 @@ class SentimentOracle:
             return "Error fetching index"
 
     def analyze_ticker_sentiment(self, ticker: str) -> str:
-        """Query Grok for a sentiment analysis of the given ticker.
+        """Ask the LLM for a sentiment analysis of the given ticker.
 
-        Returns a structured response with direction and numeric score.
-        Format: "BULLISH (Score: 8/10): reasoning..."
+        Returns a structured response in the format expected by
+        ``strategy._parse_sentiment``: ``"DIRECTION (Score: X/10): reasoning"``.
         """
+        cached = self._cache_get(f"sent:{ticker}")
+        if cached is not None:
+            return cached
+
         if self._is_circuit_open():
-            logger.info("Grok circuit breaker open. Returning NEUTRAL for %s.", ticker)
-            return "NEUTRAL (Score: 5/10): Grok temporarily unavailable."
+            logger.info(
+                "LLM circuit breaker open. Returning NEUTRAL for %s.",
+                ticker,
+            )
+            return "NEUTRAL (Score: 5/10): Sentiment oracle temporarily unavailable."
+
+        system_prompt = "You are a conservative crypto market analyst."
+        user_prompt = (
+            f"Analyze the current market sentiment for {ticker} (Crypto) based on recent "
+            "news and Twitter/X discussions. "
+            "Format your response EXACTLY as: "
+            "'DIRECTION (Score: X/10): reasoning' "
+            "where DIRECTION is BULLISH, BEARISH, or NEUTRAL, "
+            "and X is a score from 1 to 10 (1=extremely bearish, 5=neutral, "
+            "10=extremely bullish). "
+            "Provide a one-sentence reasoning. "
+            "IMPORTANT: Do NOT mention general regulatory developments "
+            "or news unless there is a specific active ban, delisting, "
+            "or enforcement action affecting this asset."
+        )
 
         try:
-            prompt = (
-                f"Analyze the current market sentiment for {ticker} (Crypto) based on recent "
-                "news and Twitter/X discussions. "
-                "Format your response EXACTLY as: "
-                "'DIRECTION (Score: X/10): reasoning' "
-                "where DIRECTION is BULLISH, BEARISH, or NEUTRAL, "
-                "and X is a score from 1 to 10 (1=extremely bearish, 5=neutral, "
-                "10=extremely bullish). "
-                "Provide a one-sentence reasoning. "
-                "IMPORTANT: Do NOT mention general regulatory developments "
-                "or news unless there is a specific active ban, delisting, "
-                "or enforcement action affecting this asset."
-            )
-
-            conversation = self._grok.chat.create(
-                model=self._model_name,
-                messages=[
-                    system("You are a conservative crypto market analyst."),
-                    user(prompt),
-                ],
-            )
-            response = conversation.sample()
-
-            if hasattr(response, "message"):
-                text = response.message.content.strip()
-            elif hasattr(response, "content"):
-                text = response.content.strip()
-            else:
-                msg = f"Unknown response structure from Grok: {type(response)}"
-                raise TypeError(msg)
-
-            self._record_success()
-            return text
+            response = self._llm.chat(system_prompt, user_prompt)
         except Exception:
-            logger.exception("Grok Analysis failed")
-            self._record_failure()
+            logger.exception("Sentiment LLM call failed")
             return "NEUTRAL (Score: 5/10): Analysis failed."
+        self._cache_put(f"sent:{ticker}", response)
+        return response
 
     def _get_proxied_session(self) -> requests.Session:
         """Return a requests.Session routed through the WARP SOCKS5 proxy."""
@@ -166,16 +185,7 @@ class SentimentOracle:
     def get_polymarket_odds(self, ticker: str) -> str:
         """Fetch Polymarket prediction market odds for a crypto ticker."""
         base_asset = ticker.split("/")[0].upper()
-        _ASSET_NAMES: dict[str, list[str]] = {
-            "BTC": ["BTC", "BITCOIN"],
-            "ETH": ["ETH", "ETHEREUM", "ETHER"],
-            "SOL": ["SOL", "SOLANA"],
-            "XRP": ["XRP", "RIPPLE"],
-            "DOGE": ["DOGE", "DOGECOIN"],
-            "SHIB": ["SHIB", "SHIBA"],
-            "LINK": ["LINK", "CHAINLINK"],
-        }
-        aliases = _ASSET_NAMES.get(base_asset, [base_asset])
+        aliases = _POLYMARKET_ASSET_NAMES.get(base_asset, [base_asset])
         asset_pattern = re.compile(
             r"\b(?:" + "|".join(re.escape(a) for a in aliases) + r")\b",
             re.IGNORECASE,
@@ -195,31 +205,9 @@ class SentimentOracle:
             if not isinstance(markets, list):
                 return "Polymarket: No data available."
 
-            matches = []
-            for market in markets:
-                question = market.get("question", "")
-                if not asset_pattern.search(question):
-                    continue
-
-                raw_prices = market.get("outcomePrices", "")
-                if not raw_prices:
-                    continue
-
-                try:
-                    prices = json.loads(raw_prices) if isinstance(raw_prices, str) else raw_prices
-                    yes_price = float(prices[0])
-                    yes_pct = round(yes_price * 100)
-                except (json.JSONDecodeError, IndexError, ValueError, TypeError):
-                    continue
-
-                if yes_pct <= 0 or yes_pct >= 100:
-                    continue
-
-                matches.append(f'"{question}" -> YES: {yes_pct}%')
-
+            matches = _filter_polymarket_matches(markets, asset_pattern)
             if matches:
                 return f"Polymarket: {' | '.join(matches[:3])}"
-
             return "Polymarket: No data available."
 
         except Exception:
@@ -246,83 +234,81 @@ class SentimentOracle:
     def get_polymarket_odds_from_cache(self, ticker: str, markets: list[dict]) -> str:
         """Filter pre-fetched Polymarket markets for a specific ticker."""
         base_asset = ticker.split("/")[0].upper()
-        asset_names: dict[str, list[str]] = {
-            "BTC": ["BTC", "BITCOIN"],
-            "ETH": ["ETH", "ETHEREUM", "ETHER"],
-            "SOL": ["SOL", "SOLANA"],
-            "XRP": ["XRP", "RIPPLE"],
-            "DOGE": ["DOGE", "DOGECOIN"],
-            "SHIB": ["SHIB", "SHIBA"],
-            "LINK": ["LINK", "CHAINLINK"],
-        }
-        aliases = asset_names.get(base_asset, [base_asset])
+        aliases = _POLYMARKET_ASSET_NAMES.get(base_asset, [base_asset])
         asset_pattern = re.compile(
             r"\b(?:" + "|".join(re.escape(a) for a in aliases) + r")\b",
             re.IGNORECASE,
         )
 
-        found = []
-        for market in markets:
-            question = market.get("question", "")
-            if not asset_pattern.search(question):
-                continue
-
-            raw_prices = market.get("outcomePrices", "")
-            if not raw_prices:
-                continue
-
-            try:
-                prices = json.loads(raw_prices) if isinstance(raw_prices, str) else raw_prices
-                yes_price = float(prices[0])
-                yes_pct = round(yes_price * 100)
-            except (json.JSONDecodeError, IndexError, ValueError, TypeError):
-                continue
-
-            if yes_pct <= 0 or yes_pct >= 100:  # noqa: PLR2004
-                continue
-
-            found.append(f'"{question}" -> YES: {yes_pct}%')
-
+        found = _filter_polymarket_matches(markets, asset_pattern)
         if found:
             return f"Polymarket: {' | '.join(found[:3])}"
-
         return "Polymarket: No data available."
 
     def get_consensus_odds(self, ticker: str) -> str:
-        """Fetch market consensus from Grok."""
+        """Ask the LLM for market consensus on a ticker's near-term direction."""
+        cached = self._cache_get(f"cons:{ticker}")
+        if cached is not None:
+            return cached
+
         if self._is_circuit_open():
-            logger.info("Grok circuit breaker open. Returning unavailable for %s.", ticker)
+            logger.info(
+                "LLM circuit breaker open. Returning unavailable for %s.",
+                ticker,
+            )
             return "Consensus unavailable."
+
+        system_prompt = "You are a market data aggregator."
+        user_prompt = (
+            f"Search for recent prediction market odds (like Polymarket) or "
+            f"expert consensus on X/Twitter regarding {ticker}. "
+            f"Is the consensus that it will go UP or DOWN in the next 24-48h? "
+            "Only include data from the last 7 days. Ignore any results older than that. "
+            "Provide the consensus direction (UP/DOWN), the approximate probability "
+            "(e.g., 65%), and a one-sentence summary. Do NOT include dates or timestamps."
+        )
 
         try:
-            prompt = (
-                f"Search for recent prediction market odds (like Polymarket) or "
-                f"expert consensus on X/Twitter regarding {ticker}. "
-                f"Is the consensus that it will go UP or DOWN in the next 24-48h? "
-                "Only include data from the last 7 days. Ignore any results older than that. "
-                "Provide the consensus direction (UP/DOWN), the approximate probability "
-                "(e.g., 65%), and a one-sentence summary. Do NOT include dates or timestamps."
-            )
-
-            conversation = self._grok.chat.create(
-                model=self._model_name,
-                messages=[
-                    system("You are a market data aggregator."),
-                    user(prompt),
-                ],
-            )
-            response = conversation.sample()
-
-            if hasattr(response, "message"):
-                text = response.message.content.strip()
-            elif hasattr(response, "content"):
-                text = response.content.strip()
-            else:
-                text = str(response).strip()
-
-            self._record_success()
-            return text
+            response = self._llm.chat(system_prompt, user_prompt)
         except Exception:
-            logger.exception("Grok Consensus fetch failed")
-            self._record_failure()
+            logger.exception("Consensus LLM call failed")
             return "Consensus unavailable."
+        self._cache_put(f"cons:{ticker}", response)
+        return response
+
+
+_POLYMARKET_ASSET_NAMES: dict[str, list[str]] = {
+    "BTC": ["BTC", "BITCOIN"],
+    "ETH": ["ETH", "ETHEREUM", "ETHER"],
+    "SOL": ["SOL", "SOLANA"],
+    "XRP": ["XRP", "RIPPLE"],
+    "DOGE": ["DOGE", "DOGECOIN"],
+    "SHIB": ["SHIB", "SHIBA"],
+    "LINK": ["LINK", "CHAINLINK"],
+}
+
+
+def _filter_polymarket_matches(markets: list[dict], asset_pattern: re.Pattern) -> list[str]:
+    """Produce formatted market strings for Polymarket questions matching a ticker."""
+    matches: list[str] = []
+    for market in markets:
+        question = market.get("question", "")
+        if not asset_pattern.search(question):
+            continue
+
+        raw_prices = market.get("outcomePrices", "")
+        if not raw_prices:
+            continue
+
+        try:
+            prices = json.loads(raw_prices) if isinstance(raw_prices, str) else raw_prices
+            yes_price = float(prices[0])
+            yes_pct = round(yes_price * 100)
+        except (json.JSONDecodeError, IndexError, ValueError, TypeError):
+            continue
+
+        if yes_pct <= 0 or yes_pct >= 100:  # noqa: PLR2004
+            continue
+
+        matches.append(f'"{question}" -> YES: {yes_pct}%')
+    return matches
