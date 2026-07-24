@@ -210,12 +210,20 @@ class TradeJournal:
             )
             self._conn.commit()
 
-    def get_last_entry_timestamp(self) -> datetime.datetime | None:
-        """Most recent BUY timestamp across all instruments (None if never)."""
+    def get_last_entry_timestamp(self, account: str | None = None) -> datetime.datetime | None:
+        """Most recent BUY timestamp across all instruments (None if never).
+
+        The analytics journal is shared across modes; pass ``account`` so a
+        PAPER process's fills cannot mask a LIVE entry drought.
+        """
+        query = "SELECT timestamp FROM trades WHERE side = 'BUY'"
+        params: tuple[str, ...] = ()
+        if account is not None:
+            query += " AND account = ?"
+            params = (account,)
+        query += " ORDER BY id DESC LIMIT 1"
         with self._lock:
-            row = self._conn.execute(
-                "SELECT timestamp FROM trades WHERE side = 'BUY' ORDER BY id DESC LIMIT 1",
-            ).fetchone()
+            row = self._conn.execute(query, params).fetchone()
         if not row:
             return None
         ts = datetime.datetime.fromisoformat(row[0])

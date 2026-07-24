@@ -1,13 +1,15 @@
 """Decision engine — evaluates entry/exit for each ticker using strategy + guardian."""
 
-import logging
+from __future__ import annotations
 
-from cache import CachedExchange
-from config import Settings
-from journal import TradeJournal
-from llm_challenger import Critique, LLMChallenger
-from models import MarketData, PositionState, StopMode, TradeSignal, fmt_price
-from notifier import NullNotifier, WebhookNotifier
+import contextlib
+import dataclasses
+import logging
+from decimal import Decimal
+from typing import TYPE_CHECKING
+
+from execution_coordinator import SubmissionOutcome
+from models import PositionState, StopMode, fmt_price
 from order_executor import (
     check_take_profit,
     compute_protection_prices,
@@ -16,7 +18,6 @@ from order_executor import (
     execute_partial_sell,
     execute_sell,
 )
-from paper_portfolio import PaperPortfolio
 from regime import RegimeClassifier
 from risk_guardian import (
     REGULATORY_DANGER_PHRASES,
@@ -24,7 +25,19 @@ from risk_guardian import (
     check_correlation_limit,
 )
 from stop_manager import StopManager
-from strategy import Strategist
+
+if TYPE_CHECKING:
+    from cache import CachedExchange
+    from config import Settings
+    from execution_coordinator import ExecutionCoordinator
+    from execution_store import ExecutionStore
+    from journal import TradeJournal
+    from llm_challenger import Critique, LLMChallenger
+    from models import MarketData, TradeSignal
+    from notifier import NullNotifier, WebhookNotifier
+    from paper_portfolio import PaperPortfolio
+    from runtime_state import RuntimeState
+    from strategy import Strategist
 
 logger = logging.getLogger("OraclePythia")
 
@@ -66,7 +79,29 @@ def _run_challenger_and_format(
     return critique.format_for_journal()
 
 
-def evaluate_exit(  # noqa: PLR0913
+def _log_signal_after_execution(  # noqa: PLR0913
+    ticker: str,
+    signal: TradeSignal,
+    data: MarketData,
+    journal: TradeJournal,
+    notifier: WebhookNotifier | NullNotifier,
+    challenger: LLMChallenger | None,
+) -> None:
+    """Persist the algorithmic decision, then run shadow commentary off-path."""
+    critique_text = _run_challenger_and_format(challenger, signal, data, notifier)
+    vol_regime = data.volatility.regime.value if data.volatility else "UNAVAILABLE"
+    journal.log_signal(
+        ticker,
+        signal.action,
+        signal.confidence,
+        signal.composite,
+        vol_regime,
+        signal.reasoning,
+        llm_critique=critique_text,
+    )
+
+
+def evaluate_exit(  # noqa: C901, PLR0913
     ticker: str,
     data: MarketData,
     settings: Settings,
@@ -78,12 +113,35 @@ def evaluate_exit(  # noqa: PLR0913
     available_slots: int,
     paper_portfolio: PaperPortfolio | None = None,
     challenger: LLMChallenger | None = None,
+    *,
+    coordinator: ExecutionCoordinator | None = None,
+    execution_store: ExecutionStore | None = None,
+    runtime: RuntimeState | None = None,
+    cycle_id: str | None = None,
 ) -> None:
     """Evaluate whether to exit an owned position, or DCA into it."""
     logger.info("Exit evaluation: %s", ticker)
 
     stop_manager = StopManager(settings)
     pos_state = journal.get_position_state(ticker)
+    if coordinator is not None and pos_state is None and execution_store is not None:
+        position = execution_store.get_position(ticker)
+        if position is not None:
+            stop_loss_price, take_profit_price = compute_protection_prices(
+                float(position.average_cost),
+                settings,
+                data,
+            )
+            pos_state = PositionState(
+                ticker=ticker,
+                entry_price=float(position.average_cost),
+                high_watermark=max(float(position.average_cost), data.current_price),
+                stop_mode=StopMode.FIXED,
+                current_sl=stop_loss_price,
+                current_tp=take_profit_price,
+                regime_at_entry="RECONCILED",
+            )
+            journal.upsert_position_state(pos_state)
 
     if pos_state and data.current_price > 0:
         journal.update_high_watermark(ticker, data.current_price)
@@ -113,10 +171,14 @@ def evaluate_exit(  # noqa: PLR0913
                 journal,
                 notifier,
                 paper_portfolio,
+                coordinator=coordinator,
+                execution_store=execution_store,
+                runtime=runtime,
+                cycle_id=cycle_id,
             )
             # v9.7: keep stop tracking when the sell did not go through —
             # the coins are still held and the next cycle must retry.
-            if sold:
+            if sold and coordinator is None:
                 journal.delete_position_state(ticker)
             return
 
@@ -132,6 +194,7 @@ def evaluate_exit(  # noqa: PLR0913
                 journal,
                 notifier,
                 paper_portfolio,
+                coordinator=coordinator,
             )
             if success:
                 pos_state.partial_exits += 1
@@ -149,30 +212,32 @@ def evaluate_exit(  # noqa: PLR0913
         journal,
         notifier,
         paper_portfolio,
+        coordinator=coordinator,
+        execution_store=execution_store,
+        runtime=runtime,
+        cycle_id=cycle_id,
     ):
         return
 
-    ensure_stop_loss(ticker, data, settings, exchange)
+    ensure_stop_loss(
+        ticker,
+        data,
+        settings,
+        exchange,
+        coordinator=coordinator,
+        execution_store=execution_store,
+        runtime=runtime,
+        desired_stop_price=None if pos_state is None else pos_state.current_sl,
+    )
 
-    trade_signal = strategist.generate_signal(data)
+    strategy_data = _strategy_data(data, settings)
+    trade_signal = strategist.generate_signal(strategy_data)
     logger.info(
         "Exit signal for %s: %s (Conf: %s) - %s",
         ticker,
         trade_signal.action,
         trade_signal.confidence,
         trade_signal.reasoning,
-    )
-
-    vol_regime = data.volatility.regime.value if data.volatility else "NORMAL"
-    critique_text = _run_challenger_and_format(challenger, trade_signal, data, notifier)
-    journal.log_signal(
-        ticker,
-        trade_signal.action,
-        trade_signal.confidence,
-        trade_signal.composite,
-        vol_regime,
-        trade_signal.reasoning,
-        llm_critique=critique_text,
     )
 
     if trade_signal.action == "SELL" and trade_signal.confidence >= settings.min_sell_confidence:
@@ -186,9 +251,21 @@ def evaluate_exit(  # noqa: PLR0913
             journal,
             notifier,
             paper_portfolio,
+            coordinator=coordinator,
+            execution_store=execution_store,
+            runtime=runtime,
+            cycle_id=cycle_id,
         )
-        if sold:
+        if sold and coordinator is None:
             journal.delete_position_state(ticker)
+        _log_signal_after_execution(
+            ticker,
+            trade_signal,
+            strategy_data,
+            journal,
+            notifier,
+            challenger,
+        )
         return
 
     execute_dca(
@@ -202,10 +279,19 @@ def evaluate_exit(  # noqa: PLR0913
         notifier,
         available_slots,
         paper_portfolio,
+        coordinator=coordinator,
+    )
+    _log_signal_after_execution(
+        ticker,
+        trade_signal,
+        strategy_data,
+        journal,
+        notifier,
+        challenger,
     )
 
 
-def evaluate_entry(  # noqa: PLR0913
+def evaluate_entry(  # noqa: C901, PLR0911, PLR0912, PLR0913, PLR0915
     ticker: str,
     data: MarketData,
     settings: Settings,
@@ -219,6 +305,11 @@ def evaluate_entry(  # noqa: PLR0913
     paper_portfolio: PaperPortfolio | None = None,
     challenger: LLMChallenger | None = None,
     budget_usd: float | None = None,
+    *,
+    coordinator: ExecutionCoordinator | None = None,
+    execution_store: ExecutionStore | None = None,
+    runtime: RuntimeState | None = None,
+    cycle_id: str | None = None,
 ) -> tuple[bool, float]:
     """Evaluate whether to enter a new position.
 
@@ -228,7 +319,29 @@ def evaluate_entry(  # noqa: PLR0913
     """
     logger.info("Entry evaluation: %s", ticker)
 
-    open_orders = exchange.get_open_orders(ticker)
+    if coordinator is not None:
+        if execution_store is None or runtime is None or not cycle_id:
+            msg = "coordinator entries require execution_store, runtime, and cycle_id"
+            raise ValueError(msg)
+        if settings.trading_mode == "LIVE" and not settings.live_entries_enabled:
+            logger.info("Entry blocked for %s: LIVE entries are not armed.", ticker)
+            return (False, 0.0)
+        if not runtime.ready or not coordinator.ready:
+            logger.warning("Entry blocked for %s: runtime reconciliation is not ready.", ticker)
+            return (False, 0.0)
+        if _has_active_buy(execution_store, ticker):
+            logger.info("Entry skipped for %s: an exact BUY order remains active.", ticker)
+            return (False, 0.0)
+    elif not data.quantitative_context_fresh:
+        # Legacy direct tests predate explicit context freshness and retain
+        # their isolated behavior; the coordinator production path is strict.
+        pass
+
+    if coordinator is not None and not data.quantitative_context_fresh:
+        logger.warning("Entry blocked for %s: quantitative context is absent or stale.", ticker)
+        return (False, 0.0)
+
+    open_orders = [] if coordinator is not None else exchange.get_open_orders(ticker)
     if open_orders:
         logger.info(
             "Entry: Skipping %s - %d open orders remain.",
@@ -245,7 +358,8 @@ def evaluate_entry(  # noqa: PLR0913
 
     price = data.current_price
 
-    combined = (data.sentiment + " " + data.consensus).upper()
+    strategy_data = _strategy_data(data, settings)
+    combined = (strategy_data.sentiment + " " + strategy_data.consensus).upper()
     if any(phrase in combined for phrase in REGULATORY_DANGER_PHRASES):
         logger.warning(
             "Entry: Regulatory Risk detected for %s. Abort.",
@@ -257,12 +371,12 @@ def evaluate_entry(  # noqa: PLR0913
         "Data for %s: Price=%s, Sentiment=%s..., Consensus=%s...",
         ticker,
         fmt_price(price),
-        data.sentiment[:30],
-        data.consensus[:30],
+        strategy_data.sentiment[:30],
+        strategy_data.consensus[:30],
     )
     logger.info("Polymarket for %s: %s", ticker, data.polymarket_odds)
 
-    trade_signal = strategist.generate_signal(data)
+    trade_signal = strategist.generate_signal(strategy_data)
     logger.info(
         "Signal: %s (Conf: %s) - %s",
         trade_signal.action,
@@ -270,19 +384,15 @@ def evaluate_entry(  # noqa: PLR0913
         trade_signal.reasoning,
     )
 
-    vol_regime = data.volatility.regime.value if data.volatility else "NORMAL"
-    critique_text = _run_challenger_and_format(challenger, trade_signal, data, notifier)
-    journal.log_signal(
-        ticker,
-        trade_signal.action,
-        trade_signal.confidence,
-        trade_signal.composite,
-        vol_regime,
-        trade_signal.reasoning,
-        llm_critique=critique_text,
-    )
-
     if trade_signal.action != "BUY":
+        _log_signal_after_execution(
+            ticker,
+            trade_signal,
+            strategy_data,
+            journal,
+            notifier,
+            challenger,
+        )
         return (False, 0.0)
 
     limit_price = price * (1 - settings.limit_order_discount_pct)
@@ -302,6 +412,50 @@ def evaluate_entry(  # noqa: PLR0913
         settings,
         data,
     )
+
+    if stop_loss_price <= 0 or stop_loss_price >= price:
+        logger.warning(
+            "Entry blocked for %s: protective stop %.8f is not below current price %.8f.",
+            ticker,
+            stop_loss_price,
+            price,
+        )
+        _log_signal_after_execution(
+            ticker,
+            trade_signal,
+            strategy_data,
+            journal,
+            notifier,
+            challenger,
+        )
+        return (False, 0.0)
+
+    if coordinator is not None:
+        guard = runtime.mutation_section() if runtime is not None else contextlib.nullcontext()
+        with guard:
+            submission = coordinator.submit_entry(
+                f"{cycle_id}:entry:{ticker}",
+                ticker,
+                Decimal(str(amount)),
+                Decimal(str(limit_price)),
+                stop_loss_price=Decimal(str(stop_loss_price)),
+                payload={"reason": trade_signal.reasoning, "cycle_id": cycle_id},
+            )
+        if runtime is not None and not coordinator.ready:
+            runtime.mark_not_ready()
+        submitted = submission.outcome in {
+            SubmissionOutcome.SUBMITTED,
+            SubmissionOutcome.ALREADY_KNOWN,
+        }
+        _log_signal_after_execution(
+            ticker,
+            trade_signal,
+            strategy_data,
+            journal,
+            notifier,
+            challenger,
+        )
+        return (submitted, target_usd if submitted else 0.0)
 
     if settings.trading_mode == "LIVE":
         logger.info(">>> EXECUTING LIVE SNIPER BUY for %s <<<", ticker)
@@ -379,3 +533,37 @@ def evaluate_entry(  # noqa: PLR0913
     journal.upsert_position_state(pos_state)
 
     return (True, target_usd)
+
+
+def _strategy_data(data: MarketData, settings: Settings) -> MarketData:
+    """Strip unadmitted external factors while retaining them for analytics."""
+    # Mode-agnostic on purpose: PAPER must be able to exercise the exact
+    # sentiment-influenced strategy path before the operator arms it in LIVE.
+    # The flag still defaults off and requires SENTIMENT_ENABLED.
+    llm_influence = settings.llm_live_influence_enabled
+    polymarket_influence = settings.polymarket_strategy_influence_enabled
+    if llm_influence and polymarket_influence:
+        return data
+    return dataclasses.replace(
+        data,
+        sentiment=(
+            data.sentiment
+            if llm_influence
+            else "NEUTRAL (Score: 5/10): LLM strategy influence disabled."
+        ),
+        consensus=data.consensus if llm_influence else "Consensus unavailable.",
+        polymarket_odds=(
+            data.polymarket_odds
+            if polymarket_influence
+            else "Polymarket: No data available for strategy."
+        ),
+    )
+
+
+def _has_active_buy(store: ExecutionStore, ticker: str) -> bool:
+    """Check exact persisted BUY orders without fuzzy exchange matching."""
+    return any(
+        store.get_order_context(order.order_id)["symbol"] == ticker
+        and store.get_order_context(order.order_id)["side"] == "BUY"
+        for order in store.list_orders(active_only=True)
+    )

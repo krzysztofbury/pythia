@@ -3,6 +3,99 @@
 All notable changes to Oracle Pythia are documented here.
 The format is loosely based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [10.0.0] - 2026-07-24
+
+Full safety rewrite of the execution, accounting, and delivery path. Motivated
+by the v9 live-loss audit: placement-as-fill accounting, stale cost basis,
+invalid stops, fee churn, and an unbounded LLM request storm.
+
+### Added
+
+- `ExecutionStore` (`src/execution_store.py`): scope-bound v10 PAPER and LIVE
+  execution persistence with exact identifiers, Decimal-safe accounting,
+  recovery-first startup, and atomic PAPER venue checkpoints. Immutable
+  exchange fills are the only accounting authority — order intents, orders,
+  fills, and position epochs are separate records with exact Kraken identity
+  and deterministic client order IDs.
+- `ExecutionCoordinator` (`src/execution_coordinator.py`): durable
+  exact-identity coordination between the exchange and the store. Entries
+  freeze on unknown orders, balance mismatch, or stale risk data.
+- `PaperExchange` (`src/paper_exchange.py`): deterministic, cash-correct spot
+  exchange simulator with production-parity semantics, plus an adapter-driven
+  market replay engine (`src/replay.py`) and a bitemporal market clock
+  (`src/market_clock.py`) for admission-controlled replay verification.
+- `src/rebuild_v10.py` and `src/migrations/`: offline, fail-closed archival of
+  the v9 database and rebuild of v10 state from exact Kraken fills and
+  balances. Pre-migration snapshots and consistent SQLite backups via
+  `src/db_backup.py`.
+- Process safety: advisory singleton lock with observable lease
+  (`src/singleton.py`), thread-safe readiness/drain admission control
+  (`src/runtime_state.py`), and bounded drain on shutdown.
+- `LLMBudgetManager` (`src/llm_budget.py`): persistent, process-safe daily,
+  monthly, and shadow spend caps for paid LLM calls.
+- Central logging redaction for credentials and secret-bearing URLs
+  (`src/redaction.py`).
+- A separate `analytics-v10.db` journal and persistent `llm-budget.db`. The
+  selected execution store, not analytics and not v9 `trades.db`, is the
+  authority for orders, fills, positions, and protections.
+- Atomic structured health publication with application/build identity,
+  lifecycle state, freshness, cycle deadline, reconciliation timestamps, and
+  bounded error codes. The container healthcheck now invokes the offline
+  `src/health.py` CLI against the configured health document.
+- CI/CD: quality pipeline (lock validation, Ruff, mypy, Bandit, pytest,
+  secret scanning), PAPER candidate and manual stable release workflows for
+  `linux/amd64` GHCR images. Publication is restricted to `main`, refuses an
+  existing SHA tag, and stable promotion verifies and retags the exact tested
+  SHA digest without rebuilding. Dependabot enabled.
+- `SPEC.md` repository contract and deployment runbooks under `deploy/`.
+
+### Changed
+
+- LLM sentiment and challenger features default off. LIVE influence requires a
+  separate opt-in. Persistent daily, monthly, and shadow spend caps plus token
+  and timeout limits bound enabled calls.
+- DCA and partial exits are disabled on the v10 coordinator path until exact
+  protection-order resizing is implemented.
+- QNAP keeps writable runtime state on `/app/logs`, exposes a separate v9
+  archive at `/archive/v9:ro`, and puts Watchtower behind an explicit profile.
+  Watchtower retains images but provides neither health-gated rollout nor
+  automatic rollback; rollback is an operator-controlled digest pin.
+- Hardened `Dockerfile` (digest-pinned base, non-root 10001) and rewritten
+  `docker-compose.yml`; images are CI-built on GHCR — no source checkout or
+  build on QNAP.
+
+### Fixed (pre-release adversarial review, 2026-07-24)
+
+- Protection-gap issues (`MISSING_PROTECTION`, `PROTECTION_REARM_FAILED`,
+  `PROTECTED_EXIT_HANDOFF_FAILED`) no longer freeze stop re-arming and exit
+  management: the remediation path restores the exchange stop first and a
+  successful protected-exit retry resolves stale intent-keyed handoff
+  failures. Previously a single failed handoff could leave a LIVE position
+  without an exchange stop indefinitely.
+- A LIVE scope with no fill cursor refuses reconciliation with an explicit
+  issue instead of importing the entire account history from epoch 0.
+- The LIVE entry-drought alert filters the shared analytics journal by
+  account, so PAPER fills cannot mask a LIVE drought (the 2026-04/06
+  trade-dead incident class), and a fresh journal measures the drought from
+  first check instead of alerting instantly on every restart.
+- `LLM_LIVE_INFLUENCE_ENABLED` now also applies in PAPER, so the exact
+  sentiment-influenced strategy path can be validated on the candidate
+  channel before real money executes it first.
+- Crash-orphaned LLM budget reservations are released at startup (with an
+  operator warning) instead of counting against the daily/monthly caps until
+  period rollover.
+- Pre-migration snapshots fsync the destination directory, closing a
+  power-loss window that could silently drop the snapshot after a migration
+  committed.
+- Container healthcheck staleness is now 2,700 s (3 cycles) and
+  operator-tunable via `HEALTHCHECK_MAX_AGE_SECONDS`; 4,500 s could mask a
+  wedged process for 75 minutes.
+
+Known fail-closed limitations are tracked as explicit pre-LIVE gates in
+[TODO.md](TODO.md) and MUST be fixed before arming LIVE.
+
+---
+
 ## [9.7.0] — 2026-06-11
 
 ### Added

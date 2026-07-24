@@ -15,6 +15,7 @@ from tenacity import (
     wait_exponential,
 )
 
+from llm_budget import LLMBudgetManager
 from llm_client import LLMClient
 
 logger = logging.getLogger(__name__)
@@ -31,7 +32,7 @@ class SentimentOracle:
     ``xai/`` to keep the old ``.env`` working without edits.
     """
 
-    def __init__(
+    def __init__(  # noqa: PLR0913
         self,
         xai_key: SecretStr | None,
         model_name: str,
@@ -41,6 +42,10 @@ class SentimentOracle:
         fallback_model: str | None = None,
         extra_api_keys: dict[str, str] | None = None,
         cache_ttl_seconds: float = 0.0,
+        enabled: bool = True,
+        budget_manager: LLMBudgetManager | None = None,
+        max_tokens: int = 512,
+        timeout_seconds: float = 30.0,
     ) -> None:
         """Build the LLM client + HTTP session state.
 
@@ -50,6 +55,7 @@ class SentimentOracle:
         """
         self._cmc_key = cmc_key
         self._warp_proxy = warp_proxy
+        self._enabled = enabled
 
         resolved_model = model_name if "/" in model_name else f"xai/{model_name}"
 
@@ -63,8 +69,9 @@ class SentimentOracle:
             primary_model=resolved_model,
             fallback_model=fallback_model,
             api_keys=api_keys,
-            max_tokens=512,
-            timeout=30.0,
+            max_tokens=max_tokens,
+            timeout=timeout_seconds,
+            budget_manager=budget_manager,
         )
 
         assert cache_ttl_seconds >= 0, f"cache_ttl_seconds must be >= 0: {cache_ttl_seconds}"  # noqa: S101
@@ -95,6 +102,8 @@ class SentimentOracle:
 
     def get_fear_and_greed_index(self) -> str:
         """Fetch the latest Crypto Fear & Greed Index from CoinMarketCap."""
+        if not self._enabled:
+            return "Data unavailable (sentiment disabled)"
         if not self._cmc_key:
             return "Data unavailable (No API Key)"
 
@@ -112,7 +121,7 @@ class SentimentOracle:
             value = item.get("value")
             label = item.get("value_classification")
 
-            return f"{value} ({label})"
+            return f"{value} ({label})"  # noqa: TRY300
         except Exception:
             logger.exception("CMC Fear & Greed fetch failed")
             return "Error fetching index"
@@ -123,6 +132,8 @@ class SentimentOracle:
         Returns a structured response in the format expected by
         ``strategy._parse_sentiment``: ``"DIRECTION (Score: X/10): reasoning"``.
         """
+        if not self._enabled:
+            return "NEUTRAL (Score: 5/10): Sentiment disabled."
         cached = self._cache_get(f"sent:{ticker}")
         if cached is not None:
             return cached
@@ -208,9 +219,9 @@ class SentimentOracle:
             matches = _filter_polymarket_matches(markets, asset_pattern)
             if matches:
                 return f"Polymarket: {' | '.join(matches[:3])}"
-            return "Polymarket: No data available."
+            return "Polymarket: No data available."  # noqa: TRY300
 
-        except Exception:
+        except Exception:  # noqa: BLE001
             logger.warning("Polymarket fetch failed for %s.", ticker, exc_info=True)
             return "Polymarket: No data available."
 
@@ -227,7 +238,7 @@ class SentimentOracle:
                 },
             )
             return markets if isinstance(markets, list) else []
-        except Exception:
+        except Exception:  # noqa: BLE001
             logger.warning("Polymarket bulk fetch failed.", exc_info=True)
             return []
 
@@ -247,6 +258,8 @@ class SentimentOracle:
 
     def get_consensus_odds(self, ticker: str) -> str:
         """Ask the LLM for market consensus on a ticker's near-term direction."""
+        if not self._enabled:
+            return "Consensus unavailable (sentiment disabled)."
         cached = self._cache_get(f"cons:{ticker}")
         if cached is not None:
             return cached

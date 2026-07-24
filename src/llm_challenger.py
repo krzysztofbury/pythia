@@ -13,20 +13,33 @@ This separation keeps the bot ToS-safe across LLM providers: the LLM provides
 commentary on an already-made decision rather than issuing trading instructions.
 """
 
+from __future__ import annotations
+
 import json
 import logging
 import re
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import TYPE_CHECKING, Literal, Protocol
 
 from llm_client import LLMClient
-from models import MarketData, TradeSignal
 
 logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from llm_budget import LLMBudgetManager
+    from models import MarketData, TradeSignal
 
 ConcernLevel = Literal["NONE", "LOW", "MEDIUM", "HIGH"]
 
 _VALID_LEVELS: frozenset[str] = frozenset({"NONE", "LOW", "MEDIUM", "HIGH"})
+
+
+class ChallengerSettings(Protocol):
+    """Settings fields required to construct optional shadow commentary."""
+
+    challenger_enabled: bool
+    challenger_model: str
+    challenger_fallback_model: str | None
 
 
 @dataclass(frozen=True)
@@ -186,8 +199,11 @@ def _parse_critique(raw: str, *, model: str) -> Critique | None:
     )
 
 
-def build_challenger_from_settings(settings: object) -> LLMChallenger:
-    """Factory: build an LLMChallenger from a Settings-like object.
+def build_challenger_from_settings(
+    settings: ChallengerSettings,
+    budget_manager: LLMBudgetManager | None = None,
+) -> LLMChallenger:
+    """Build an LLMChallenger from a Settings-like object.
 
     Duck-typed so tests can pass mocks. Required fields: ``challenger_enabled``,
     ``challenger_model``, ``challenger_fallback_model``, and the relevant
@@ -197,7 +213,7 @@ def build_challenger_from_settings(settings: object) -> LLMChallenger:
     missing = [f for f in required if not hasattr(settings, f)]
     assert not missing, f"build_challenger_from_settings: missing fields {missing}"  # noqa: S101
 
-    if not settings.challenger_enabled:
+    if not settings.challenger_enabled or not getattr(settings, "sentiment_enabled", True):
         return LLMChallenger(client=None, enabled=False)
 
     api_keys: dict[str, str] = {}
@@ -215,7 +231,9 @@ def build_challenger_from_settings(settings: object) -> LLMChallenger:
         primary_model=settings.challenger_model,
         fallback_model=settings.challenger_fallback_model,
         api_keys=api_keys,
-        max_tokens=512,
-        timeout=30.0,
+        max_tokens=getattr(settings, "llm_max_tokens", 512),
+        timeout=getattr(settings, "llm_timeout_seconds", 30.0),
+        budget_manager=budget_manager,
+        shadow=True,
     )
     return LLMChallenger(client=client, enabled=True)
