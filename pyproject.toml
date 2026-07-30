@@ -21,7 +21,7 @@ dependencies = [
     "pmdarima>=2.0.4",
     "PySocks>=1.7.1",
     "optuna>=4.0.0",
-    "litellm>=1.52.0",
+    "litellm>=1.84.0",
 ]
 
 [tool.setuptools.package-dir]
