@@ -59,4 +59,9 @@ indent-style = "space"
 pythonpath = ["src"]
 
 [tool.uv]
-exclude-newer = "2026-05-13T00:00:00Z"
+# Rolling window, never a hardcoded date: a fixed cutoff silently ages into a
+# patch blocker (it reached 78 days and stranded 74 security advisories).
+# 14 days keeps brand-new releases out of a re-lock while letting security
+# fixes through. Reproducibility comes from uv.lock + `uv sync --frozen`,
+# which pin the exact resolved instant.
+exclude-newer = "14 days"

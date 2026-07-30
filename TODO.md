@@ -61,31 +61,30 @@ acceptable on the PAPER candidate channel but not for LIVE operation.
 
 ---
 
-## Supply chain — `exclude-newer` blocks all security patching
+## Supply chain — land the outstanding dependency security updates
 
-`pyproject.toml` sets `[tool.uv] exclude-newer = "2026-05-13T00:00:00Z"`, so
-dependency resolution cannot see anything published after that date. As of
-2026-07-30 that is 78 days of missed patches and **74 open Dependabot alerts
-(2 critical, 31 high)** across `litellm`, `pillow`, `setuptools`, `soupsieve`,
-`cryptography`, `aiohttp`, `urllib3`, `requests`, `protobuf`, and others.
+**74 Dependabot alerts (2 critical, 31 high)** are open across `litellm`,
+`pillow`, `setuptools`, `soupsieve`, `cryptography`, `aiohttp`, `urllib3`,
+`requests`, `protobuf`, and others — a backlog accumulated while a hardcoded
+`exclude-newer = "2026-05-13T00:00:00Z"` made every later patch unresolvable.
+Dependabot failed with `dependency_file_not_resolvable` on each attempt
+(observed 2026-07-30 for litellm, pillow, setuptools).
 
-Dependabot security updates **cannot succeed** while the pin stands — every
-attempt fails with `dependency_file_not_resolvable` because the patched version
-postdates the cutoff (observed 2026-07-30 for litellm, pillow, setuptools). The
-`.github/dependabot.yml` shipped in v10 is therefore inert for security updates.
+The cutoff is now a rolling `exclude-newer = "14 days"`, so patches older than
+the window resolve normally and Dependabot can open per-package PRs, each with
+its own CI run. Remaining work is to review and land those PRs.
 
-`uv.lock` plus `uv sync --frozen` (what CI already runs) is what actually
-provides reproducibility; `exclude-newer` adds none on top of a committed
-lockfile and only blocks patching. Decide deliberately:
+Two things to keep in mind while doing it:
 
-1. Drop `exclude-newer`, run `uv lock`, and re-verify. Note that the test suite
-   mocks `litellm.completion`, so a green suite does **not** validate a real
-   litellm upgrade — exercise the actual provider path before trusting it.
-2. Or keep the pin and accept that dependency CVEs go unpatched, in which case
-   remove `dependabot.yml`'s security expectations so the failure is not silent.
+- A fix published inside the last 14 days is still outside the window by
+  design. If a critical advisory lands and must ship immediately, use
+  `exclude-newer-package` for that one package rather than widening the window.
+- The test suite mocks `litellm.completion`, so a green suite does **not**
+  validate a real litellm upgrade. Exercise the actual provider path before
+  trusting a litellm bump in LIVE.
 
-Not folded into the v10 release on purpose: bumping the dependency tree of an
-already-reviewed safety release would invalidate its verification.
+Deliberately kept out of the v10.0.0 release: bumping the dependency tree of an
+already-reviewed safety release would have invalidated its verification.
 
 ---
 
