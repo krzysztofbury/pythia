@@ -1,12 +1,18 @@
 """RiskGuardian: pre-trade safety gates and portfolio-level risk checks."""
 
-import logging
+from __future__ import annotations
 
-from cache import CachedExchange
-from config import Settings
-from exchange import KrakenExchange
-from journal import TradeJournal
-from models import TradeSignal
+import logging
+from decimal import Decimal
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from cache import CachedExchange
+    from config import Settings
+    from exchange import KrakenExchange
+    from execution_store import ExecutionStore
+    from journal import TradeJournal
+    from models import TradeSignal
 
 logger = logging.getLogger("OraclePythia")
 
@@ -79,15 +85,20 @@ class RiskGuardian:
         self,
         settings: Settings,
         exchange: CachedExchange | KrakenExchange,
+        *,
+        market_exchange: CachedExchange | KrakenExchange | None = None,
+        execution_store: ExecutionStore | None = None,
     ) -> None:
         """Initialize the Guardian."""
         self.settings = settings
         self.exchange = exchange
+        self.market_exchange = market_exchange or exchange
+        self.execution_store = execution_store
 
     def check_liquidity(self, symbol: str) -> bool:
         """Check if the market liquidity (spread) is healthy."""
         try:
-            structure = self.exchange.get_market_structure(symbol)
+            structure = self.market_exchange.get_market_structure(symbol)
             spread = structure["spread_pct"]
             limit = self.settings.max_spread_pct
 
@@ -136,7 +147,7 @@ class RiskGuardian:
         )
         return balance
 
-    def check_buy(  # noqa: PLR0913
+    def check_buy(  # noqa: C901, D417, PLR0911, PLR0913
         self,
         symbol: str,
         price: float,
@@ -175,11 +186,15 @@ class RiskGuardian:
             return 0.0
 
         try:
-            total_balance = self.exchange.get_free_balance(
-                self.settings.quote_currency,
+            free_quote = float(self.exchange.get_free_balance(self.settings.quote_currency))
+            total_quote = (
+                float(self.exchange.get_total_balance(self.settings.quote_currency))
+                if self.execution_store is not None
+                else free_quote
             )
+            total_equity, existing_exposure = self._marked_equity(symbol, price, total_quote)
             slots = max(available_slots, 1)
-            base_size = total_balance / slots
+            base_size = free_quote / slots
 
             multiplier = 1.0
             if self.settings.conviction_sizing_enabled:
@@ -221,7 +236,10 @@ class RiskGuardian:
                     multiplier = 1.0
 
             tier_scaled = base_size * multiplier
-            concentration_cap = total_balance * self.settings.max_position_pct_of_balance
+            concentration_cap = max(
+                total_equity * self.settings.max_position_pct_of_balance - existing_exposure,
+                0.0,
+            )
             candidates = [
                 tier_scaled,
                 concentration_cap,
@@ -234,13 +252,13 @@ class RiskGuardian:
 
             # Round up to the exchange minimum only when balance AND the
             # intra-cycle budget can actually cover the bumped order.
-            spendable = total_balance if budget_usd is None else min(total_balance, budget_usd)
+            spendable = free_quote if budget_usd is None else min(free_quote, budget_usd)
             # The bump must never breach the concentration cap — on a depleted
             # account (balance < MIN_ORDER/max_pct) rounding up would put >40%
             # of the book into one position.
             if (
                 ROUND_UP_THRESHOLD <= target_usd < MIN_ORDER_USD <= spendable
-                and MIN_ORDER_USD <= concentration_cap
+                and concentration_cap >= MIN_ORDER_USD
             ):
                 logger.info(
                     "Guardian: Rounding up %s to $%s for Kraken.",
@@ -255,7 +273,7 @@ class RiskGuardian:
                 "budget $%s, dca=%s)",
                 symbol,
                 target_usd,
-                total_balance,
+                free_quote,
                 slots,
                 base_size,
                 multiplier,
@@ -268,12 +286,12 @@ class RiskGuardian:
             logger.exception("Guardian: Failed to calculate position size")
             return 0.0
 
-        if total_balance < target_usd:
+        if free_quote < target_usd:
             logger.warning(
                 "Guardian: Insufficient %s funds for %s. Have %s, need %s",
                 self.settings.quote_currency,
                 symbol,
-                total_balance,
+                free_quote,
                 target_usd,
             )
             return 0.0
@@ -295,6 +313,40 @@ class RiskGuardian:
             target_usd,
         )
         return amount
+
+    def _marked_equity(
+        self,
+        candidate_symbol: str,
+        candidate_price: float,
+        total_quote: float,
+    ) -> tuple[float, float]:
+        """Return total marked equity and candidate post-trade exposure already reserved."""
+        store = self.execution_store
+        if store is None:
+            return total_quote, 0.0
+
+        marked_positions = 0.0
+        candidate_exposure = 0.0
+        for position in store.list_open_positions():
+            mark = (
+                candidate_price
+                if position.symbol == candidate_symbol
+                else float(self.market_exchange.fetch_price(position.symbol))
+            )
+            value = float(position.quantity) * mark
+            marked_positions += value
+            if position.symbol == candidate_symbol:
+                candidate_exposure += value
+
+        # Active BUY quantities are conservative marked reservations. Free quote
+        # already enforces the cash reservation; this term enforces concentration.
+        for order in store.list_orders(active_only=True):
+            context = store.get_order_context(order.order_id)
+            if context["side"] != "BUY" or context["symbol"] != candidate_symbol:
+                continue
+            remaining = max(order.requested_quantity - order.filled_quantity, Decimal(0))
+            candidate_exposure += float(remaining) * candidate_price
+        return total_quote + marked_positions, candidate_exposure
 
 
 def check_correlation_limit(
@@ -343,7 +395,7 @@ def check_correlation_limit(
     return True
 
 
-def check_daily_loss_limit(journal: TradeJournal, settings: Settings) -> bool:
+def check_daily_loss_limit(journal: TradeJournal | ExecutionStore, settings: Settings) -> bool:
     """Check if daily loss limit has been exceeded. Returns True if trading is OK."""
     daily_pnl = journal.get_daily_realized_pnl()
     if daily_pnl < -settings.daily_loss_limit_usd:

@@ -1,0 +1,135 @@
+name: oracle-pythia
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-file: "5"
+    max-size: 10m
+
+x-oracle-common: &oracle-common
+  platform: linux/amd64
+  restart: unless-stopped
+  init: true
+  depends_on:
+    warp-proxy:
+      condition: service_healthy
+  user: "10001:10001"
+  read_only: true
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+  stop_grace_period: 90s
+  tmpfs:
+    - /tmp:rw,noexec,nosuid,size=128m,mode=1777
+  networks:
+    - proxy-egress
+  logging: *default-logging
+
+services:
+  warp-proxy:
+    image: ${WARP_IMAGE:-ghcr.io/mon-ius/docker-warp-socks:v6}
+    platform: linux/amd64
+    restart: unless-stopped
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 30s
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=32m,mode=1777
+      - /etc/sing-box:rw,noexec,nosuid,size=16m,mode=0700
+    healthcheck:
+      test:
+        - CMD
+        - curl
+        - -x
+        - socks5h://127.0.0.1:9091
+        - -fsSL
+        - https://www.cloudflare.com/cdn-cgi/trace
+      interval: 1m
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    labels:
+      com.centurylinklabs.watchtower.enable: "false"
+    networks:
+      - proxy-egress
+    logging: *default-logging
+
+  oracle-candidate:
+    <<: *oracle-common
+    profiles:
+      - candidate
+    image: ${GHCR_IMAGE:?Set GHCR_IMAGE in config.env}:${CANDIDATE_TAG:-candidate}
+    env_file:
+      - ${CANDIDATE_ENV_FILE:-candidate.env}
+    environment:
+      LIVE_ENTRIES_ENABLED: "false"
+      MAX_DCA_PER_POSITION: "0"
+      PARTIAL_EXIT_ENABLED: "false"
+      TRADING_MODE: PAPER
+      WARP_PROXY: socks5h://warp-proxy:9091
+    volumes:
+      - candidate-logs:/app/logs
+      - ${LEGACY_ARCHIVE_DIR:-./archive/v9}:/archive/v9:ro
+    labels:
+      com.centurylinklabs.watchtower.enable: "false"
+      com.centurylinklabs.watchtower.scope: oracle-pythia-candidate
+
+  oracle-live:
+    <<: *oracle-common
+    profiles:
+      - live
+    image: ${GHCR_IMAGE:?Set GHCR_IMAGE in config.env}${STABLE_REF:-:stable}
+    env_file:
+      - ${LIVE_ENV_FILE:-live.env}
+    environment:
+      MAX_DCA_PER_POSITION: "0"
+      PARTIAL_EXIT_ENABLED: "false"
+      WARP_PROXY: socks5h://warp-proxy:9091
+    volumes:
+      - live-logs:/app/logs
+      - ${LEGACY_ARCHIVE_DIR:-./archive/v9}:/archive/v9:ro
+    labels:
+      com.centurylinklabs.watchtower.enable: "${WATCHTOWER_STABLE_SELECTED:-false}"
+      com.centurylinklabs.watchtower.scope: oracle-pythia-stable
+
+  watchtower:
+    image: ${WATCHTOWER_IMAGE:-containrrr/watchtower:1.7.1}
+    platform: linux/amd64
+    profiles:
+      - watchtower
+    restart: unless-stopped
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 30s
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m,mode=1777
+    environment:
+      WATCHTOWER_CLEANUP: "false"
+      WATCHTOWER_LABEL_ENABLE: "true"
+      WATCHTOWER_POLL_INTERVAL: "${WATCHTOWER_POLL_INTERVAL:-86400}"
+      WATCHTOWER_SCOPE: oracle-pythia-stable
+      WATCHTOWER_TIMEOUT: 90s
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ${WATCHTOWER_DOCKER_CONFIG_FILE:?Set WATCHTOWER_DOCKER_CONFIG_FILE in config.env}:/config.json:ro
+    labels:
+      com.centurylinklabs.watchtower.enable: "false"
+    networks:
+      - management
+    logging: *default-logging
+
+networks:
+  management:
+    internal: false
+  proxy-egress:
+    internal: false
+
+volumes:
+  candidate-logs:
+  live-logs:

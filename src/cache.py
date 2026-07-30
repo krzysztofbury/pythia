@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import logging
 import threading
-from collections.abc import Callable
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 logger = logging.getLogger(__name__)
 
@@ -90,9 +92,16 @@ class CachedExchange:
 
     def fetch_balance(self) -> dict:
         """Fetch full balance (cached)."""
+        fetch_balance = (
+            self._exchange.fetch_balance
+            if callable(getattr(type(self._exchange), "fetch_balance", None))
+            else None
+        )
+        if fetch_balance is None:
+            fetch_balance = self._exchange._client.fetch_balance  # noqa: SLF001
         return self._cache.get_or_compute(
             "balance",
-            lambda: self._exchange._client.fetch_balance(),  # noqa: SLF001
+            fetch_balance,
         )
 
     def get_free_balance(self, currency: str) -> float:

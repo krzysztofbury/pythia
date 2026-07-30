@@ -239,6 +239,7 @@ class TestBuildChallengerFromSettings:
         settings = _make_settings()
         # Simulate operator setting via .env
         settings.challenger_enabled = True
+        settings.sentiment_enabled = True
         challenger = build_challenger_from_settings(settings)
         assert challenger.enabled is True
 

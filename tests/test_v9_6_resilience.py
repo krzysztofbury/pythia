@@ -26,6 +26,8 @@ def _make_settings(**overrides):
     from config import Settings
 
     env = {**_ENV, **{k.upper(): str(v) for k, v in overrides.items()}}
+    if overrides.get("trading_mode") == "LIVE":
+        env.setdefault("TRADING_ACCOUNT_ID", "test-account")
     with patch.dict("os.environ", env, clear=False):
         s = Settings()
     for k, v in overrides.items():
@@ -438,10 +440,10 @@ class TestEntryDroughtAlert:
 
         return TradeJournal(db_path=str(tmp_path / "trades.db"))
 
-    def _log_buy(self, journal, *, days_ago: float):
+    def _log_buy(self, journal, *, days_ago: float, account: str = "Kraken-LIVE"):
         ts = datetime.now(UTC) - timedelta(days=days_ago)
         journal.log_trade(
-            account="Kraken",
+            account=account,
             instrument="BTC/USDC",
             side="BUY",
             price=50_000.0,
@@ -505,6 +507,28 @@ class TestEntryDroughtAlert:
         settings.no_entry_alert_hours = 0.0
         notifier = MagicMock()
         assert check_entry_drought(journal, settings, notifier, _state={}) is False
+
+    def test_paper_fills_do_not_mask_live_drought(self, tmp_path):
+        """Regression: shared analytics DB — PAPER BUYs suppressed the LIVE alert."""
+        from main import check_entry_drought
+
+        journal = self._journal(tmp_path)
+        self._log_buy(journal, days_ago=10.0, account="Kraken-LIVE")
+        self._log_buy(journal, days_ago=0.1, account="Kraken-PAPER")
+        settings = _make_settings(trading_mode="LIVE")
+        notifier = MagicMock()
+        assert check_entry_drought(journal, settings, notifier, _state={}) is True
+
+    def test_fresh_journal_does_not_alert_immediately(self, tmp_path):
+        """A v10 cutover starts with an empty journal — no instant false alarm."""
+        from main import check_entry_drought
+
+        journal = self._journal(tmp_path)
+        settings = _make_settings(trading_mode="LIVE")
+        notifier = MagicMock()
+        state: dict = {}
+        assert check_entry_drought(journal, settings, notifier, _state=state) is False
+        assert "none_since_monotonic" in state
 
 
 class TestRunCycleNamesResolve:

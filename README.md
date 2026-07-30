@@ -1,10 +1,33 @@
-# Oracle Pythia v9.7
+# Oracle Pythia 10.0.0
 
-An autonomous crypto trading bot on Kraken, driven by algorithmic strategy (weighted composite scoring), Gemini or any LiteLLM-backed model (Sentiment — commentary only, never trade decisions), Polymarket (Prediction Markets), quantitative analysis (Technical Indicators, GARCH Volatility, ARIMA Forecasting), market regime detection, conviction-tiered position sizing, and a ToS-safe LLM Challenger that reviews — but never makes — trade decisions.
+An autonomous crypto trading bot on Kraken with rule-based composite strategy,
+exact v10 execution accounting, PAPER/LIVE state isolation, quantitative
+analysis, and optional off-path LiteLLM commentary. LLM features are disabled
+by default and never submit orders.
 
-## What's New in v9.0 – v9.7
+## What's New in 10.0.0
 
 See [CHANGELOG.md](CHANGELOG.md) for full release notes.
+
+- **Execution-store authority**: `paper-execution-v10.db` or
+  `live-execution-v10.db` is the authoritative scoped order, fill, position,
+  and protection ledger. `analytics-v10.db` is a derived journal for signals,
+  market snapshots, and reporting; it is not execution truth.
+- **Recovery-first runtime**: exact identifiers, Decimal-safe accounting,
+  single-process locking, bounded drain, and atomic PAPER checkpoints replace
+  reconstruction from the v9 journal.
+- **Structured health**: an atomic JSON lifecycle document reports version,
+  build, boot identity, state, freshness, cycle deadline, reconciliation, and
+  bounded error codes. Docker checks it offline with `src/health.py`.
+- **Safe release channels**: `main` publishes a PAPER candidate and one-time
+  SHA tag after CI; stable promotion retags the exact tested digest without a
+  rebuild and requires production approval.
+- **Conservative optional inputs**: LLM sentiment and challenger are off by
+  default, LIVE influence requires a separate opt-in, and persistent daily,
+  monthly, and shadow spend caps apply. DCA and partial exits are disabled in
+  the v10 coordinator until exact protection resizing exists.
+
+### v9 Release History
 
 - **v9.0 — modular refactor**: `main.py` split 1995 -> 359 LOC across `risk_guardian`, `data_pipeline`, `order_executor`, `decision_engine`, `portfolio_manager`. All hardcoded strategy thresholds (entry/exit/DCA/mean-reversion, stale-position) moved to `Settings` so operators tune via `.env` without code edits. Legacy `MIN_CONFIDENCE=0.10` (a Gemini-era artifact) removed; replaced by explicit `min_buy_confidence` / `min_sell_confidence` floors (default 0.0 — defer to strategy thresholds).
 - **v9.1 — LiteLLM + LLM Challenger**: `xai-sdk` replaced by LiteLLM so any provider (Claude, Gemini, DeepSeek, GPT, Grok) is a one-line config change. New `LLMChallenger` reviews every BUY/SELL the algorithm makes and logs a structured critique — **commentary only, never blocks execution**. ToS-safe across providers. HIGH-concern reviews fire a notifier alert. Default off; enable with `CHALLENGER_ENABLED=true` plus the relevant provider key.
@@ -21,10 +44,10 @@ See [CHANGELOG.md](CHANGELOG.md) for full release notes.
 - **The Brain (Strategy)** (`strategy.py`): Algorithmic weighted-composite scoring engine with regime-aware modifiers and multi-timeframe alignment. Thresholds and weights configurable via `Settings`. No LLM on the decision path — all buy/sell/hold signals are rule-based.
 - **The Challenger** (`llm_challenger.py`): Reads every BUY/SELL decision the algorithm makes and produces a structured `Critique(concern_level, thesis, concerns)`. ToS-safe — the LLM provides commentary, never trade instructions. Default off.
 - **The Regime Detector** (`regime.py`): Rule-based market regime classifier (trending/ranging/breakout) that adjusts strategy behavior, entry thresholds, and stop-loss modes dynamically.
-- **The Stop Manager** (`stop_manager.py`): Per-position stop management with three modes (Fixed, Trailing, Trailing+Breakeven), time-based ROI exits, and partial position exits.
+- **The Stop Manager** (`stop_manager.py`): Per-position stop management with three modes (Fixed, Trailing, Trailing+Breakeven) and time-based ROI exits. The v10 coordinator does not execute partial exits pending exact protection resizing.
 - **The Guardian (Risk)** (`risk_guardian.py`): Pre-trade gates — liquidity, correlation limits, daily loss circuit breaker, position aging. Conviction-tiered position sizing with a 40%-of-balance concentration cap and intra-cycle budget to prevent multi-entry stacking.
 - **The Decision Engine** (`decision_engine.py`): Orchestrates per-ticker exit and entry flows — strategy → guardian → challenger → executor.
-- **The Executor** (`order_executor.py`): Sell, partial sell, DCA, protection orders, fill reconciliation. Strict "Maker-Only" enforcement via CCXT.
+- **The Executor** (`order_executor.py`, `execution_coordinator.py`): Exact maker-order submission, recovery, fills, exits, and protection orders. DCA and partial exits are blocked pending exact protection resizing.
 - **The Pipeline** (`data_pipeline.py`): Parallel fetch of price, indicators, sentiment, regime, volatility, forecast, funding rates.
 - **The Portfolio Manager** (`portfolio_manager.py`): Ticker classification (owned vs. available).
 - **The Analyst (Quant)** (`indicators.py`, `volatility.py`, `forecast.py`, `analytics.py`, `signal_analytics.py`): Technical indicators (RSI, MACD, Bollinger Bands, ATR, ADX, ROC, OBV, EMA 21/50), GARCH volatility modeling, ARIMA price forecasting, portfolio analytics, per-asset breakdown, MAE/MFE, factor attribution.
@@ -33,7 +56,7 @@ See [CHANGELOG.md](CHANGELOG.md) for full release notes.
 
 ### Thread Safety
 
-v9.x collects market data in parallel via `ThreadPoolExecutor`. All shared state is protected:
+v10 collects market data in parallel via `ThreadPoolExecutor`. All shared state is protected:
 - `TradeJournal` — SQLite access serialized via `threading.Lock`
 - `CachedExchange` — thread-safe `get_or_compute()` pattern with lock
 - `LLMClient` (shared by `SentimentOracle` and `LLMChallenger`) — circuit breaker counter protected by lock
@@ -62,7 +85,9 @@ v9.x collects market data in parallel via `ThreadPoolExecutor`. All shared state
 | `src/forecast.py` | Auto-ARIMA price forecasting with 95% confidence intervals |
 | `src/analytics.py` | Portfolio metrics: win rate, P&L, drawdown, daily Sharpe ratio, tax |
 | `src/signal_analytics.py` | Per-asset stats, MAE/MFE, factor attribution |
-| `src/journal.py` | Thread-safe SQLite trade journal with position state, market snapshots, daily P&L, LLM critiques |
+| `src/execution_store.py` | Authoritative scoped v10 orders, fills, positions, and protections |
+| `src/journal.py` | Derived analytics journal in `analytics-v10.db`; never execution authority |
+| `src/health.py` | Atomic structured lifecycle publication and offline health CLI |
 | `src/cache.py` | Thread-safe per-cycle caching proxy for exchange API calls |
 | `src/models.py` | Shared types: MarketData, TradeSignal, MarketRegime, StopMode, PositionState, MultiTimeframeContext |
 | `src/notifier.py` | Discord/Slack webhook notifications |
@@ -103,7 +128,7 @@ Safety gates (in order of application):
 1. **Per-position concentration cap**: `MAX_POSITION_PCT_OF_BALANCE` = 40% default
 2. **Absolute hard cap**: `MAX_POSITION_SIZE_USD` = $50 default, ceiling $500
 3. **Intra-cycle budget**: tracked across entries so two tier-4 signals in one cycle can't double-spend the cached balance
-4. **DCA clamp**: multiplier capped at 1.0× for DCA to prevent stacking on existing positions
+4. **DCA status**: v10 execution disables DCA until protection quantities can be resized exactly
 
 Set `CONVICTION_SIZING_ENABLED=false` to restore v9.1 flat behaviour.
 
@@ -118,7 +143,7 @@ Set `CONVICTION_SIZING_ENABLED=false` to restore v9.1 flat behaviour.
 | Trailing stop-loss | SL ratchets up with price (1.5×ATR below high watermark). Never moves down |
 | Breakeven lock | After +1×ATR profit, SL moves to entry price (capital protection) |
 | Time-based ROI | Profit targets decay over time: 4% at 0 min, 3% at 60 min, 2% at 120 min, 1% at 240 min |
-| Partial exits | Sell 50% at 2×ATR profit, let remaining 50% trail |
+| Partial exits | Disabled in v10 execution pending exact protection resizing |
 | ATR-based stops | SL = entry − 2×ATR, TP = entry + 3×ATR (fallback for FIXED mode) |
 | SL floor clamp | Stop-loss never exceeds 50% below entry (protects low-price assets) |
 | Regime-aware stops | Trailing in trends, breakeven in downtrends, fixed in ranges |
@@ -177,21 +202,21 @@ Assets not in the table get their own unique group (no correlation limit, but st
    ```
    *Required keys:*
    - `KRAKEN_API_KEY` & `KRAKEN_PRIVATE_KEY` (Permissions: Query Funds, Modify Orders. **NO Withdrawal**).
-   - `GEMINI_API_KEY` (Gemini, required — the default sentiment model `gemini/gemini-3.5-flash`).
 
    *Optional keys:*
+   - `GEMINI_API_KEY` - required only when an enabled model uses Gemini.
    - `CMC_API_KEY` — CoinMarketCap Fear & Greed Index.
    - `XAI_API_KEY`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY` — enable LLM Challenger and/or a sentiment fallback on a different provider (recommended: `SENTIMENT_FALLBACK_MODEL=xai/grok-4-1-fast-reasoning`).
    - `WEBHOOK_URL` / `ERROR_WEBHOOK_URL` — Discord/Slack notifications.
 
-4. **Run**:
+4. **Run in PAPER mode**:
    ```bash
-   # Paper Mode (Default)
    PYTHONPATH=src uv run python src/main.py
-
-   # Live Mode
-   TRADING_MODE=LIVE PYTHONPATH=src uv run python src/main.py
    ```
+
+   LIVE requires the account identifier, acknowledgement, and explicit entry
+   switch documented in [deploy/qnap/README.md](deploy/qnap/README.md). Validate
+   the exact candidate under representative PAPER load before promotion.
 
 5. **Run Backtester** (standalone):
    ```bash
@@ -220,9 +245,15 @@ All settings can be overridden via environment variables or `.env`.
 | `TRADING_UNIVERSE` | `BTC/USDC,ETH/USDC,SOL/USDC,AVAX/USDC,DOT/USDC,LINK/USDC,XRP/USDC` | Comma-separated trading pairs |
 | `QUOTE_CURRENCY` | `USDC` | Quote currency for balances |
 | `MAX_POSITION_SIZE_USD` | `50.0` | Hard cap per position (ceiling raised to $500 in v9.2) |
+| `SENTIMENT_ENABLED` | `false` | Enable paid LLM sentiment calls; disabled is free and deterministic |
+| `LLM_LIVE_INFLUENCE_ENABLED` | `false` | Separate LIVE opt-in; otherwise enabled LLM output remains shadow-only |
 | `SENTIMENT_MODEL` | `gemini/gemini-3.5-flash` | Sentiment/consensus model, LiteLLM format (bare legacy names auto-prefix `xai/`) |
 | `SENTIMENT_FALLBACK_MODEL` | *(unset)* | Fallback model on a different provider — strongly recommended |
 | `SENTIMENT_CACHE_SECONDS` | `3600` | Per-ticker TTL cache for sentiment+consensus LLM calls (0 disables) |
+| `LLM_MONTHLY_BUDGET_USD` | `1.0` | Persistent monthly cap; also bounds monthly shadow spend |
+| `LLM_DAILY_SHADOW_BUDGET_USD` | `0.05` | Persistent UTC daily runtime cap |
+| `LLM_MAX_TOKENS` | `512` | Per-call output-token cap |
+| `LLM_TIMEOUT_SECONDS` | `30` | Per-call timeout in seconds |
 | `REQUIRE_BULLISH_SENTIMENT` | `false` | `true` restores the legacy hard gate (LLM outage disables all entries) |
 | `NO_ENTRY_ALERT_HOURS` | `72` | Webhook alert when a LIVE bot opens nothing for N hours (0 disables) |
 
@@ -273,7 +304,7 @@ All settings can be overridden via environment variables or `.env`.
 |---|---|---|
 | `CHALLENGER_ENABLED` | `false` | Enable per-decision LLM review (commentary only) |
 | `CHALLENGER_MODEL` | `anthropic/claude-sonnet-4-5` | Primary challenger model (LiteLLM format) |
-| `CHALLENGER_FALLBACK_MODEL` | `gemini/gemini-2.5-flash` | Fallback model if primary fails |
+| `CHALLENGER_FALLBACK_MODEL` | `gemini/gemini-3.5-flash` | Fallback model if primary fails |
 | `SENTIMENT_FALLBACK_MODEL` | *(unset)* | Fallback for Grok sentiment if primary fails |
 | `ANTHROPIC_API_KEY` | *(unset)* | Required when using `anthropic/*` models |
 | `GEMINI_API_KEY` | *(unset)* | Required when using `gemini/*` models |
@@ -298,7 +329,7 @@ All settings can be overridden via environment variables or `.env`.
 | `BREAKEVEN_ATR_THRESHOLD` | `1.0` | Move SL to entry after this much ATR profit |
 | `ROI_ENABLED` | `true` | Enable time-based ROI exits |
 | `ROI_SCHEDULE` | `0:4.0,60:3.0,120:2.0,240:1.0` | Time-decaying profit targets (min:pct) |
-| `PARTIAL_EXIT_ENABLED` | `true` | Enable partial position exits |
+| `PARTIAL_EXIT_ENABLED` | `true` | Legacy strategy knob; v10 coordinator blocks partial execution pending exact protection resizing |
 | `PARTIAL_EXIT_PCT` | `0.50` | Percentage of position to sell (50%) |
 | `PARTIAL_EXIT_ATR_THRESHOLD` | `2.0` | Trigger partial exit after 2×ATR profit |
 | `STOP_LOSS_PCT` | `0.02` | Fallback fixed SL (2%) when ATR unavailable |
@@ -309,7 +340,7 @@ All settings can be overridden via environment variables or `.env`.
 | `MAX_TOTAL_CRYPTO_POSITIONS` | `5` | Portfolio-wide cap across all groups (v9.5) |
 | `DAILY_LOSS_LIMIT_USD` | `20.0` | Pause entries if daily losses exceed this |
 | `POSITION_MAX_AGE_HOURS` | `120` | Review stale positions after N hours |
-| `MAX_DCA_PER_POSITION` | `1` | Max additional DCA buys per position |
+| `MAX_DCA_PER_POSITION` | `1` | Legacy limit; v10 coordinator blocks DCA pending exact protection resizing |
 | `MAX_ENTRIES_PER_CYCLE` | `2` | Max new positions per 15-min cycle |
 | `STALE_ORDER_MAX_AGE_SECONDS` | `7200` | Cancel unfilled orders after N seconds |
 | `DYNAMIC_RISK_ENABLED` | `false` | Apply GARCH vol multipliers to SL/TP |
@@ -341,17 +372,25 @@ All settings can be overridden via environment variables or `.env`.
 | `TAX_RATE` | `0.19` | Tax rate on realized profits (19% PL) |
 | `WEBHOOK_URL` | *(unset)* | Discord/Slack webhook for trade notifications |
 | `ERROR_WEBHOOK_URL` | *(unset)* | Separate webhook for errors |
-| `HEALTHCHECK_FILE` | `logs/healthcheck` | Path for Docker healthcheck file |
+| `PAPER_STATE_DB_PATH` | `logs/paper-execution-v10.db` | Authoritative PAPER execution store |
+| `LIVE_STATE_DB_PATH` | `logs/live-execution-v10.db` | Authoritative LIVE execution store |
+| `ANALYTICS_DB_PATH` | `logs/analytics-v10.db` | Derived analytics journal; not execution authority |
+| `LLM_BUDGET_DB_PATH` | `logs/llm-budget.db` | Persistent LLM reservation and spend ledger |
+| `HEALTHCHECK_FILE` | `logs/healthcheck` | Atomic structured JSON health document |
 | `LOG_RETENTION_DAYS` | `30` | Daily log rotation retention (v9.6: 7 destroyed incident evidence) |
 
 ## Docker Deployment
 
-The bot runs as two containers: the trading bot and a Cloudflare WARP sidecar that proxies Polymarket traffic. Docker HEALTHCHECK auto-restarts if no cycle completes within 1 hour.
+The local stack runs the PAPER-only bot and a Cloudflare WARP sidecar. The
+image healthcheck runs `python /app/src/health.py` against the configured
+structured health document. An `unhealthy` status is an operator signal:
+Docker does not restart a running process solely because a healthcheck fails.
+`restart: unless-stopped` applies when the process exits.
 
 | Service | Image | Purpose |
 |---|---|---|
-| `oracle-pythia` | `ghcr.io/astral-sh/uv:python3.13-bookworm-slim` | Trading bot |
-| `warp-proxy` | `ghcr.io/mon-ius/docker-warp-socks:v5` | SOCKS5 proxy for Polymarket (port 9091) |
+| `oracle-pythia` | `oracle-pythia:dev` | Locally built PAPER trading bot |
+| `warp-proxy` | `ghcr.io/mon-ius/docker-warp-socks:v6` | SOCKS5 proxy for Polymarket (internal port 9091) |
 
 Only Polymarket API calls route through the WARP proxy. All other traffic (Kraken, Grok/LiteLLM providers, CMC) uses direct connections.
 
@@ -372,10 +411,8 @@ docker compose up -d
 # 4. Check logs
 docker logs -f oracle-pythia
 
-# 5. When ready for live trading, edit .env:
-#    TRADING_MODE=LIVE
-#    Then restart:
-docker compose restart oracle-pythia
+# This local Compose service is forced to PAPER.
+# Use the reviewed candidate/stable QNAP flow for LIVE.
 ```
 
 ### Step-by-Step Docker Installation
@@ -384,7 +421,7 @@ docker compose restart oracle-pythia
 
 - Docker Engine 24+ and Docker Compose v2+
 - Kraken account with API key (Query Funds + Modify Orders permissions only — **never enable Withdrawal**)
-- Google Gemini API key from [aistudio.google.com](https://aistudio.google.com)
+- A provider API key only if an optional LLM feature is enabled
 
 #### 1. Clone and Configure
 
@@ -400,7 +437,6 @@ Edit `.env` with your editor:
 # Required
 KRAKEN_API_KEY=your_kraken_api_key
 KRAKEN_PRIVATE_KEY=your_kraken_private_key
-GEMINI_API_KEY=your_gemini_api_key
 
 # Start in PAPER mode to validate
 TRADING_MODE=PAPER
@@ -412,7 +448,8 @@ TRADING_UNIVERSE=BTC/USDC,ETH/USDC,SOL/USDC,AVAX/USDC,DOT/USDC,LINK/USDC,XRP/USD
 # Set position size (hard cap ceiling $500 in v9.2; default 50)
 MAX_POSITION_SIZE_USD=50.0
 
-# Optional: enable LLM Challenger
+# Optional paid LLM features remain shadow-only unless separately armed
+# SENTIMENT_ENABLED=true
 # CHALLENGER_ENABLED=true
 # ANTHROPIC_API_KEY=your_anthropic_key
 ```
@@ -434,13 +471,12 @@ docker compose up -d
 ```bash
 docker logs -f oracle-pythia
 # Expect:
-# --- ORACLE PYTHIA BOOTING VERSION 9.5 ---
-# Effective config: mode=PAPER quote=USDC universe=[...]
-# Oracle Pythia Bot Started.
-# Starting FULL Cycle. Mode: PAPER
+# Oracle Pythia v10 booting mode=PAPER
+# Starting FULL cycle ... mode=PAPER
 ```
 
-The `Effective config:` line (v9.5) is the deploy-safety breadcrumb — it confirms the bot picked up the expected `.env` values.
+The structured health document carries `app_version=10.0.0`, the image
+`BUILD_VERSION`, lifecycle state, freshness, and cycle deadline.
 
 #### 4. Monitor
 
@@ -448,46 +484,51 @@ The `Effective config:` line (v9.5) is the deploy-safety breadcrumb — it confi
 # Live logs
 docker logs -f oracle-pythia
 
-# Trade database
-sqlite3 logs/trades.db "SELECT date, instrument, side, price, profit FROM trades ORDER BY id DESC LIMIT 10;"
-
-# LLM critiques (v9.1)
-sqlite3 logs/trades.db "SELECT ticker, action, llm_critique FROM signals WHERE llm_critique != '' ORDER BY id DESC LIMIT 10;"
-
-# Per-asset P&L (v9.4)
-sqlite3 logs/trades.db "SELECT instrument, COUNT(*) AS trades, ROUND(SUM(profit),2) AS pnl FROM trades WHERE side='SELL' GROUP BY instrument ORDER BY pnl DESC;"
-
-# Funding rate history (v9.5, requires FUNDING_RATES_ENABLED)
-sqlite3 logs/trades.db "SELECT ticker, timestamp, funding_rate FROM market_snapshots WHERE funding_rate IS NOT NULL ORDER BY id DESC LIMIT 20;"
-
-# Health check
-cat logs/healthcheck
+# Exact offline health command used by the image HEALTHCHECK
+docker compose exec oracle-pythia \
+  /app/.venv/bin/python /app/src/health.py /app/logs/healthcheck \
+  --max-age-seconds 4500
 ```
 
 #### 5. Switch to Live Trading
 
-```bash
-sed -i 's/TRADING_MODE=PAPER/TRADING_MODE=LIVE/' .env
-docker compose restart oracle-pythia
-```
+The local Compose definition intentionally overrides `TRADING_MODE=PAPER` and
+`LIVE_ENTRIES_ENABLED=false`. Follow the candidate, production approval,
+stable-digest promotion, and four-part LIVE arming procedure in
+[deploy/qnap/README.md](deploy/qnap/README.md).
 
 ### Logs & Data
 
 | File | Description |
 |---|---|
 | `logs/bot.log` | Main bot log (time-rotated daily, 30-day retention) |
-| `logs/trades.db` | SQLite database — single source of truth for all structured data |
-| `logs/healthcheck` | Healthcheck timestamp (used by Docker) |
+| `logs/paper-execution-v10.db` | Authoritative PAPER execution store |
+| `logs/live-execution-v10.db` | Authoritative LIVE execution store, isolated from PAPER |
+| `logs/analytics-v10.db` | Derived trades, signals, snapshots, and optimization analytics |
+| `logs/llm-budget.db` | Persistent paid-LLM budget ledger |
+| `logs/paper-exchange-state.json` | Atomic PAPER venue checkpoint |
+| `logs/healthcheck` | Atomic structured health JSON checked by Docker |
 
-All structured data lives in SQLite (`trades.db`):
+The selected v10 execution store is the sole local authority for orders, fills,
+positions, and protections. A reviewed analytics rebuild command is future
+work; no operator rebuild command exists today. Do not infer positions or order
+state from the analytics `trades` table.
 
-| Table | Contents |
-|---|---|
-| `trades` | Trade journal with P&L, fees, and exchange fill IDs |
-| `signals` | All trading signals with composite scores and LLM critiques (v9.1 `llm_critique` column) |
-| `position_state` | Per-position stop tracking (high watermark, SL/TP, partial exits) |
-| `market_snapshots` | Full market context per cycle for backtest replay (v9.5 `funding_rate` column) |
-| `optimization_runs` | Optuna optimization results |
+A v9 `trades.db` is a read-only legacy archive, never v10 execution state. Keep
+it outside the writable runtime state volume; the QNAP deployment exposes it
+only at `/archive/v9:ro` and does not configure v10 to open it.
+
+### Candidate and Stable
+
+`Publish candidate` runs quality checks on `main`, builds `linux/amd64` once,
+and publishes `candidate` plus a one-time `sha-<git-sha>` tag. Its registry
+digest is the authority; publication refuses to overwrite an existing SHA tag.
+`Promote stable` verifies that digest against the tested SHA tag and retags the
+same manifest as `stable` without checking out or rebuilding source.
+
+Watchtower is optional and explicitly profiled on QNAP. It provides neither a
+health-gated rollout nor automatic rollback; see the retained-image and manual
+digest rollback procedure in the QNAP guide.
 
 ## Development
 
@@ -495,7 +536,7 @@ All structured data lives in SQLite (`trades.db`):
 # Install dependencies
 uv sync
 
-# Run tests (357+ tests as of v9.5)
+# Run tests
 uv run pytest tests/ -v
 
 # Lint

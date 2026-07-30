@@ -1,35 +1,79 @@
+name: oracle-pythia-dev
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-file: "5"
+    max-size: 10m
+
 services:
   warp-proxy:
-    image: ghcr.io/mon-ius/docker-warp-socks:v5
+    image: ghcr.io/mon-ius/docker-warp-socks:v6
     container_name: warp-proxy
     restart: unless-stopped
-    dns:
-      - 8.8.8.8
-      - 1.1.1.1
-    environment:
-      - WARP_SLEEP=2
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 30s
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=32m,mode=1777
+      - /etc/sing-box:rw,noexec,nosuid,size=16m,mode=0700
+    healthcheck:
+      test:
+        - CMD
+        - curl
+        - -x
+        - socks5h://127.0.0.1:9091
+        - -fsSL
+        - https://www.cloudflare.com/cdn-cgi/trace
+      interval: 1m
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    networks:
+      - proxy-egress
+    logging: *default-logging
 
   oracle-pythia:
-    image: ghcr.io/astral-sh/uv:python3.13-bookworm-slim
+    image: oracle-pythia:dev
     container_name: oracle-pythia
+    build:
+      context: .
+      args:
+        VERSION: dev
+    platform: linux/amd64
     restart: unless-stopped
-    working_dir: /app
-    entrypoint: []
+    init: true
     depends_on:
-      - warp-proxy
-    dns:
-      - 8.8.8.8
-      - 1.1.1.1
-    volumes:
-      - ./logs:/app/logs
-      - ./.env:/app/.env:ro
+      warp-proxy:
+        condition: service_healthy
+    env_file:
+      - ${PYTHIA_ENV_FILE:-.env}
     environment:
-      - PYTHONPATH=/app/src
-      - PYTHONUNBUFFERED=1
-      - WARP_PROXY=socks5h://warp-proxy:9091
-    healthcheck:
-      test: ["CMD", "python", "-c", "import os,time; f='logs/healthcheck'; exit(0 if os.path.exists(f) and time.time()-os.path.getmtime(f)<3600 else 1)"]
-      interval: 5m
-      timeout: 10s
-      retries: 3
-      start_period: 2m
+      LIVE_ENTRIES_ENABLED: "false"
+      MAX_DCA_PER_POSITION: "0"
+      PARTIAL_EXIT_ENABLED: "false"
+      TRADING_MODE: PAPER
+      WARP_PROXY: socks5h://warp-proxy:9091
+    user: "10001:10001"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 90s
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=128m,mode=1777
+    volumes:
+      - oracle-logs:/app/logs
+    networks:
+      - proxy-egress
+    logging: *default-logging
+
+networks:
+  proxy-egress:
+    internal: false
+
+volumes:
+  oracle-logs:

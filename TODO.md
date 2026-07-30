@@ -4,6 +4,113 @@ Forward-looking work. For what's already shipped see [CHANGELOG.md](CHANGELOG.md
 
 ---
 
+## v10 Pre-LIVE Gates — MUST fix before arming LIVE
+
+Findings from the 2026-07-24 adversarial review of the v10 rewrite. All are
+fail-closed today (they wedge readiness, never corrupt money state), which is
+acceptable on the PAPER candidate channel but not for LIVE operation.
+
+1. **Issue-lifecycle remediation path.** `HALT_UNKNOWN_ORDER_FILL` and
+   `INVALID_OPEN_ORDER` are recorded but have no resolve path and there is no
+   operator CLI for `resolve_reconciliation_issue` — one manual trade in the
+   Kraken app (fill reconciliation is account-wide) permanently halts the bot
+   until manual SQLite surgery. Build a reviewed operator remediation CLI.
+2. **Fill re-attribution after late order binding.** `_fill_hash` includes
+   `order_id`, so a fill first stored with `order_id NULL` (entry response
+   lost + order lookup failing in the same pass) raises `PayloadConflictError`
+   on re-reconciliation and freezes the fill cursor. Exclude mutable owner
+   columns from the hash and match the fetched order's `cl_ord_id` before the
+   NULL fallback (`execution_coordinator.py` `_apply_exchange_fill`).
+3. **Bounded UNKNOWN→FAILED path.** A submission Kraken never admitted stays
+   UNKNOWN forever (transition graph allows UNKNOWN→FAILED, nothing takes it);
+   the ticker stays reserved by `reserved_entry_tickers`. Needs a bounded
+   non-admission criterion (completed fill window + closed-orders check past
+   the submission timestamp).
+4. **Ambiguous stop-amend adoption.** Amend admitted + read-back failed leaves
+   the store expecting the old trigger; `verify_protective_stop` then loops
+   `PROTECTION_MISMATCH` forever even though the exchange trigger is strictly
+   better. Adopt the observed trigger when it is the invariant-safe direction.
+5. **Same-millisecond fill ordering.** Sort keys use `(timestamp, fill_id)`
+   in the coordinator, store rebuild (`ORDER BY executed_at_ms, fill_id`), and
+   `rebuild_v10.py`; Kraken txids are not chronological, so an opposite-side
+   pair in one millisecond can abort with `FillApplicationError`. Use Kraken's
+   monotonic `trade_id` (present in the raw payload) as the tiebreaker —
+   needs a persisted column in `fills`.
+6. **Universe-scoped position management.** A position whose symbol is removed
+   from `ORACLE_UNIVERSE` is silently unmanaged (no stop verify, no ratchet,
+   no exits, no issue recorded). Drive recovery/protection/exit sweeps from
+   `store.list_open_positions()` instead of the settings list.
+7. **Mode-scoped shared state.** `analytics_db_path`, `healthcheck_file`, and
+   `llm_budget_db_path` are not mode-scoped while the singleton lock is —
+   dual-mode in one directory lets a PAPER process mask a dead LIVE process's
+   healthcheck. Scope the defaults per mode or reject dual-mode same-dir.
+8. **Account-scoped mutual exclusion.** The singleton lock is
+   filesystem-scoped; two LIVE containers on different volumes can trade the
+   same Kraken account with a real double-exposure window before reconciliation
+   halts them. Derive the lock identity from the account digest and/or add an
+   exchange-side mutual-exclusion check.
+9. **Quality digest ≠ published digest.** The CI smoke tests a different image
+   build than `publish-candidate` pushes (base is digest-pinned now, but build
+   args differ and the published digest itself is never executed in CI). Either
+   run the smoke against the pushed candidate digest or accept the QNAP PAPER
+   soak as the first execution.
+10. **Paper-venue fill eviction.** `PaperExchange` silently evicts fills beyond
+    `max_fill_events` while the live exchange refuses truncation
+    (`FillPaginationLimitError`); the cursor can advance past evicted fills
+    with `complete=True`. Raise when `since_ms` predates retained history.
+
+---
+
+## Supply chain — `exclude-newer` blocks all security patching
+
+`pyproject.toml` sets `[tool.uv] exclude-newer = "2026-05-13T00:00:00Z"`, so
+dependency resolution cannot see anything published after that date. As of
+2026-07-30 that is 78 days of missed patches and **74 open Dependabot alerts
+(2 critical, 31 high)** across `litellm`, `pillow`, `setuptools`, `soupsieve`,
+`cryptography`, `aiohttp`, `urllib3`, `requests`, `protobuf`, and others.
+
+Dependabot security updates **cannot succeed** while the pin stands — every
+attempt fails with `dependency_file_not_resolvable` because the patched version
+postdates the cutoff (observed 2026-07-30 for litellm, pillow, setuptools). The
+`.github/dependabot.yml` shipped in v10 is therefore inert for security updates.
+
+`uv.lock` plus `uv sync --frozen` (what CI already runs) is what actually
+provides reproducibility; `exclude-newer` adds none on top of a committed
+lockfile and only blocks patching. Decide deliberately:
+
+1. Drop `exclude-newer`, run `uv lock`, and re-verify. Note that the test suite
+   mocks `litellm.completion`, so a green suite does **not** validate a real
+   litellm upgrade — exercise the actual provider path before trusting it.
+2. Or keep the pin and accept that dependency CVEs go unpatched, in which case
+   remove `dependabot.yml`'s security expectations so the failure is not silent.
+
+Not folded into the v10 release on purpose: bumping the dependency tree of an
+already-reviewed safety release would invalidate its verification.
+
+---
+
+## v10 Release Follow-ups
+
+- **Exact protection resizing:** DCA and partial exits remain disabled on the
+  v10 coordinator path. Implement cancel/replace recovery and exact reserved
+  quantity accounting before either feature can be enabled.
+- **Reviewed rebuild tooling:** v9 `trades.db` remains a read-only archive and
+  `analytics-v10.db` is not execution authority. No supported rebuild/import
+  command exists. Specify provenance, scope checks, idempotency, dry-run output,
+  and recovery behavior before adding an operator command.
+- **Representative candidate validation:** exercise the exact candidate digest
+  under representative PAPER load before stable promotion; a quiet window is
+  not verification.
+- **Watchtower decision:** keep it profile-disabled unless the operator accepts
+  daemon-equivalent socket access, private-registry credential mounting, and
+  manual retained-image/digest rollback without health gating.
+
+v10 LLM defaults are intentionally conservative: sentiment and challenger are
+off, LIVE influence is separately gated, and enabled calls are bounded by the
+persistent daily/monthly/shadow budget ledger plus token and timeout caps.
+
+---
+
 ## 1. Wire funding rate into composite score — SHIPPED v9.7 (validation pending)
 
 **Status 2026-06-11:** wired as `W_FUNDING=0.03` with contrarian normalization (±0.1%/8h cap) and active-weight redistribution when data is absent. Remaining before trusting it live: enable `FUNDING_RATES_ENABLED=true`, collect 30+ days of `market_snapshots.funding_rate`, walk-forward validate.
@@ -21,9 +128,11 @@ Forward-looking work. For what's already shipped see [CHANGELOG.md](CHANGELOG.md
 
 ---
 
-## 1b. Order-identity fill reconciliation
+## 1b. Order-identity fill reconciliation - SUPERSEDED v10
 
-**Why (Zeno review 2026-06-11):** fills are deduped against bot placement rows by fuzzy ticker+side+qty(±5%)+180min matching. Robust fix: capture the exchange order id at `place_maker_buy`/`place_maker_sell` time, journal it on the placement row, and reconcile fills by updating that row instead of inserting — removes both double-count and false-dedup classes entirely.
+The v10 execution store records exact order and fill identities and is the
+execution authority. Legacy fuzzy matching in the analytics journal must not be
+used to reconstruct runtime positions or order state.
 
 ---
 

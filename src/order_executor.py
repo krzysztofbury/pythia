@@ -1,16 +1,28 @@
 """Order execution — sell, partial sell, DCA, protection orders, fill reconciliation."""
 
-import logging
+from __future__ import annotations
 
-from cache import CachedExchange
-from config import Settings
-from exchange import KrakenExchange
-from journal import TradeJournal
+import contextlib
+import logging
+from decimal import Decimal
+from typing import TYPE_CHECKING
+
+from execution_coordinator import SubmissionOutcome
+from execution_store import OrderState
 from models import MarketData, PositionState, StopMode, TradeSignal, fmt_price
-from notifier import NullNotifier, WebhookNotifier
-from paper_portfolio import PaperPortfolio
 from regime import RegimeClassifier
 from risk_guardian import MIN_ORDER_USD, RiskGuardian
+
+if TYPE_CHECKING:
+    from cache import CachedExchange
+    from config import Settings
+    from exchange import KrakenExchange
+    from execution_coordinator import ExecutionCoordinator
+    from execution_store import ExecutionStore
+    from journal import TradeJournal
+    from notifier import NullNotifier, WebhookNotifier
+    from paper_portfolio import PaperPortfolio
+    from runtime_state import RuntimeState
 
 logger = logging.getLogger("OraclePythia")
 
@@ -63,7 +75,7 @@ def compute_protection_prices(
     return stop_loss_price, take_profit_price
 
 
-def execute_sell(  # noqa: PLR0913
+def execute_sell(  # noqa: C901, PLR0911, PLR0912, PLR0913
     ticker: str,
     price: float,
     buy_price: float | None,
@@ -73,6 +85,11 @@ def execute_sell(  # noqa: PLR0913
     journal: TradeJournal,
     notifier: WebhookNotifier | NullNotifier,
     paper_portfolio: PaperPortfolio | None = None,
+    *,
+    coordinator: ExecutionCoordinator | None = None,
+    execution_store: ExecutionStore | None = None,
+    runtime: RuntimeState | None = None,
+    cycle_id: str | None = None,
 ) -> bool:
     """Execute a sell order (shared by TP and AI-driven exits).
 
@@ -81,6 +98,38 @@ def execute_sell(  # noqa: PLR0913
     used to drop stop tracking while the coins were still held.
     """
     assert price > 0, f"Sell price must be positive, got {price}"  # noqa: S101
+
+    if coordinator is not None:
+        if execution_store is None or not cycle_id:
+            msg = "coordinator exits require execution_store and cycle_id"
+            raise ValueError(msg)
+        position = execution_store.get_position(ticker)
+        if position is None:
+            logger.info("Sell skipped for %s: no reconciled position.", ticker)
+            return False
+        if Decimal(str(price)) * position.quantity < Decimal(str(MIN_ORDER_USD)):
+            logger.info("Sell skipped for %s: reconciled position is below venue minimum.", ticker)
+            return False
+        guard = runtime.mutation_section() if runtime is not None else contextlib.nullcontext()
+        with guard:
+            result = coordinator.submit_protected_exit(
+                f"{cycle_id}:exit:{ticker}",
+                ticker,
+                position.quantity,
+                Decimal(str(price)),
+                payload={"reason": reason},
+            )
+        if runtime is not None and not coordinator.ready:
+            runtime.mark_not_ready()
+        if result.submission is not None and result.submission.outcome in {
+            SubmissionOutcome.SUBMITTED,
+            SubmissionOutcome.ALREADY_KNOWN,
+        }:
+            logger.info(
+                "Exit for %s is pending exact fills; inventory remains authoritative.",
+                ticker,
+            )
+        return result.submission is not None and result.submission.state is OrderState.FILLED
 
     if settings.trading_mode == "PAPER" and paper_portfolio:
         amount_to_sell = paper_portfolio.get_free_balance(
@@ -163,8 +212,16 @@ def execute_partial_sell(  # noqa: PLR0913
     journal: TradeJournal,
     notifier: WebhookNotifier | NullNotifier,
     paper_portfolio: PaperPortfolio | None,
+    *,
+    coordinator: ExecutionCoordinator | None = None,
 ) -> bool:
     """Execute a partial position sell. Returns True if the order succeeded."""
+    if coordinator is not None:
+        logger.warning(
+            "Partial exit disabled for %s: exact protection resizing is unavailable.",
+            ticker,
+        )
+        return False
     base_currency = ticker.split("/")[0]
 
     if settings.trading_mode == "PAPER" and paper_portfolio:
@@ -224,6 +281,11 @@ def check_take_profit(  # noqa: PLR0913
     journal: TradeJournal,
     notifier: WebhookNotifier | NullNotifier,
     paper_portfolio: PaperPortfolio | None,
+    *,
+    coordinator: ExecutionCoordinator | None = None,
+    execution_store: ExecutionStore | None = None,
+    runtime: RuntimeState | None = None,
+    cycle_id: str | None = None,
 ) -> bool:
     """Check hard take-profit and execute sell if hit. Returns True if sold."""
     buy_price = data.entry_price
@@ -254,23 +316,103 @@ def check_take_profit(  # noqa: PLR0913
             journal,
             notifier,
             paper_portfolio,
+            coordinator=coordinator,
+            execution_store=execution_store,
+            runtime=runtime,
+            cycle_id=cycle_id,
         )
-        if sold:
+        if sold and coordinator is None:
             journal.delete_position_state(ticker)
         return sold
 
     return False
 
 
-def ensure_stop_loss(
+def ensure_stop_loss(  # noqa: C901, PLR0911, PLR0912, PLR0913
     ticker: str,
     data: MarketData,
     settings: Settings,
     exchange: CachedExchange,
+    *,
+    coordinator: ExecutionCoordinator | None = None,
+    execution_store: ExecutionStore | None = None,
+    runtime: RuntimeState | None = None,
+    desired_stop_price: float | None = None,
 ) -> None:
     """Place a stop-loss order if none exists (LIVE mode only)."""
     buy_price = data.entry_price
-    if not buy_price or settings.trading_mode != "LIVE":
+    if not buy_price:
+        return
+
+    if coordinator is not None:
+        if execution_store is None:
+            msg = "coordinator stop placement requires execution_store"
+            raise ValueError(msg)
+        position = execution_store.get_position(ticker)
+        if position is None:
+            return
+        stop_loss_price, _take_profit_price = compute_protection_prices(
+            buy_price,
+            settings,
+            data,
+        )
+        if desired_stop_price is not None:
+            stop_loss_price = max(stop_loss_price, desired_stop_price)
+        if stop_loss_price >= data.current_price:
+            logger.warning(
+                "Protective stop rejected for %s: %.8f is not below current price %.8f.",
+                ticker,
+                stop_loss_price,
+                data.current_price,
+            )
+            return
+        active_protections = execution_store.list_protection(ticker, active_only=True)
+        covered_quantity = sum(
+            (Decimal(str(item["quantity"])) for item in active_protections),
+            start=Decimal(0),
+        )
+        if active_protections and covered_quantity == position.quantity:
+            verifications = [
+                coordinator.verify_protective_stop(str(item["protection_id"]))
+                for item in active_protections
+            ]
+            if all(item.valid for item in verifications):
+                current_triggers = [
+                    Decimal(str(item["trigger_price"])) for item in active_protections
+                ]
+                target = Decimal(str(stop_loss_price))
+                if any(trigger < target for trigger in current_triggers):
+                    guard = (
+                        runtime.mutation_section()
+                        if runtime is not None
+                        else contextlib.nullcontext()
+                    )
+                    with guard:
+                        ratcheted = coordinator.ratchet_protective_stops(
+                            ticker,
+                            target,
+                            Decimal(str(data.current_price)),
+                        )
+                    if not ratcheted:
+                        logger.warning("Protective stop ratchet was not confirmed for %s.", ticker)
+                return
+        guard = runtime.mutation_section() if runtime is not None else contextlib.nullcontext()
+        try:
+            with guard:
+                coordinator.ensure_protective_stop(
+                    ticker,
+                    position.quantity,
+                    Decimal(str(stop_loss_price)),
+                    position.average_cost,
+                    Decimal(str(data.current_price)),
+                )
+        except Exception:  # noqa: BLE001
+            logger.warning("Failed to ensure exact protective stop for %s.", ticker, exc_info=True)
+        if runtime is not None and not coordinator.ready:
+            runtime.mark_not_ready()
+        return
+
+    if settings.trading_mode != "LIVE":
         return
 
     open_orders = exchange.get_open_orders(ticker)
@@ -319,8 +461,13 @@ def execute_dca(  # noqa: PLR0913
     notifier: WebhookNotifier | NullNotifier,
     available_slots: int,
     paper_portfolio: PaperPortfolio | None,
+    *,
+    coordinator: ExecutionCoordinator | None = None,
 ) -> None:
     """Execute a DCA buy if the strategy signals BUY on an owned position."""
+    if coordinator is not None:
+        logger.info("DCA disabled for %s: exact protection resizing is unavailable.", ticker)
+        return
     if trade_signal.action != "BUY" or trade_signal.confidence < settings.min_buy_confidence:
         return
 
@@ -504,7 +651,7 @@ def reconcile_stale_orders(
             )
 
 
-def _process_single_fill(
+def _process_single_fill(  # noqa: PLR0913
     fill: dict,
     ticker: str,
     journal: TradeJournal,
@@ -603,7 +750,7 @@ def _process_single_fill(
         )
 
 
-def reconcile_fills(
+def reconcile_fills(  # noqa: PLR0913
     tickers: list[str],
     exchange: KrakenExchange,
     journal: TradeJournal,
@@ -628,5 +775,5 @@ def reconcile_fills(
                     quote_currency,
                     tax_rate,
                 )
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001, PERF203
             logger.warning("Fill reconciliation error for %s: %s", ticker, exc)

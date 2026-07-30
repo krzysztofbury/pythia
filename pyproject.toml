@@ -1,6 +1,6 @@
 [project]
 name = "oracle-pythia"
-version = "9.5.0"
+version = "10.0.0"
 description = "Autonomous crypto trading bot on Kraken with algorithmic strategy, Grok sentiment, Polymarket odds, and quantitative analysis."
 readme = "README.md"
 requires-python = ">=3.13"

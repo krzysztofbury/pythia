@@ -1,0 +1,109 @@
+name: Reusable quality
+
+on:
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  RUFF_MAX_FINDINGS: "167"
+  UV_VERSION: "0.11.3"
+
+jobs:
+  python:
+    name: Pytest and Ruff ratchet
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install uv and Python 3.13
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: "3.13"
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Synchronize locked dependencies
+        run: uv sync --frozen --group dev
+
+      - name: Run test suite
+        run: uv run pytest tests/ -q
+
+      - name: Enforce current critical Ruff rules
+        run: uv run ruff check src --select E9,F63,F7
+
+      - name: Enforce Ruff finding-count ratchet
+        shell: bash
+        run: |
+          count="$({ uv run ruff check src --output-format json --exit-zero; } | uv run python -c 'import json, sys; print(len(json.load(sys.stdin)))')"
+          uv run ruff check src --statistics --exit-zero
+          echo "Ruff findings: ${count} (maximum ${RUFF_MAX_FINDINGS})"
+          if (( count > RUFF_MAX_FINDINGS )); then
+            echo "Ruff findings increased above the repository baseline." >&2
+            exit 1
+          fi
+
+  container:
+    name: linux/amd64 offline container smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Validate Compose definitions
+        shell: bash
+        run: |
+          PYTHIA_ENV_FILE=.env.example docker compose -f docker-compose.yml config --quiet
+          CANDIDATE_ENV_FILE=candidate.env.example \
+            LIVE_ENV_FILE=live.env.example \
+            docker compose \
+              --env-file deploy/qnap/config.env.example \
+              -f deploy/qnap/compose.yaml \
+              --profile candidate \
+              --profile live \
+              --profile watchtower \
+              config --quiet
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      - name: Build smoke image
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          load: true
+          platforms: linux/amd64
+          push: false
+          tags: oracle-pythia:quality
+          build-args: |
+            VERSION=quality-${{ github.sha }}
+            VCS_REF=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Verify command, state writes, and structured health offline
+        shell: bash
+        run: |
+          command_json="$(docker image inspect oracle-pythia:quality --format '{{json .Config.Cmd}}')"
+          test "${command_json}" = '["/app/.venv/bin/python","/app/src/main.py"]'
+          docker run --rm \
+            --network none \
+            --read-only \
+            --cap-drop ALL \
+            --security-opt no-new-privileges \
+            --tmpfs /tmp:rw,noexec,nosuid,size=128m,mode=1777 \
+            --tmpfs /app/logs:rw,noexec,nosuid,size=16m,mode=0700,uid=10001,gid=10001 \
+            --env TRADING_MODE=PAPER \
+            oracle-pythia:quality \
+            /bin/sh -ec '
+              /app/.venv/bin/python -c "import os, runpy; assert os.getuid() == 10001; assert os.environ[\"BUILD_VERSION\"].startswith(\"quality-\"); runpy.run_path(\"/app/src/main.py\", run_name=\"__docker_smoke__\")"
+              /app/.venv/bin/python -c "import os; from health import HealthReporter, HealthState; health = HealthReporter(os.environ[\"HEALTHCHECK_FILE\"], app_version=\"10.0.0\", build_version=os.environ[\"BUILD_VERSION\"]); health.set_state(HealthState.READY)"
+              /app/.venv/bin/python -c "import os, sqlite3; source=\"/app/logs/write-smoke.db\"; target=source + \".renamed\"; db=sqlite3.connect(source); db.execute(\"CREATE TABLE smoke (value INTEGER NOT NULL)\"); db.execute(\"INSERT INTO smoke VALUES (1)\"); db.commit(); db.close(); os.replace(source, target); db=sqlite3.connect(target); assert db.execute(\"SELECT value FROM smoke\").fetchone() == (1,); db.close()"
+              exec /app/.venv/bin/python /app/src/health.py "${HEALTHCHECK_FILE:-/app/logs/healthcheck}" --max-age-seconds 4500
+            '

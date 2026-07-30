@@ -121,3 +121,28 @@ class MarketData:
     # v9.5: perp funding rate from secondary exchange (informational; not yet
     # fed into composite). Negative = shorts paying longs (contrarian bullish).
     funding_rate: float | None = None
+
+    # FULL cycles populate expensive quantitative context. FAST cycles must
+    # explicitly reuse a fresh snapshot rather than silently assuming NORMAL.
+    quantitative_context_fresh: bool = False
+    quantitative_context_observed_at: float | None = None
+
+
+@dataclass
+class FullCycleContext:
+    """Reusable FULL-cycle inputs and per-symbol quantitative outputs."""
+
+    observed_at: float | None = None
+    fear_greed: str = ""
+    polymarket_markets: list[dict] | None = None
+    volatility_by_ticker: dict[str, object] | None = None
+    forecast_by_ticker: dict[str, object] | None = None
+
+    def __post_init__(self) -> None:
+        """Initialize mutable containers per instance."""
+        if self.polymarket_markets is None:
+            self.polymarket_markets = []
+        if self.volatility_by_ticker is None:
+            self.volatility_by_ticker = {}
+        if self.forecast_by_ticker is None:
+            self.forecast_by_ticker = {}

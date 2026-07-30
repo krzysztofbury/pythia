@@ -266,7 +266,7 @@ class TestMinSellConfidenceGate:
 
         from decision_engine import evaluate_exit
         from journal import TradeJournal
-        from models import TradeSignal
+        from models import MarketData, TradeSignal
 
         settings = _make_settings()
         settings.min_sell_confidence = 0.9  # impossibly high — blocks all strategy SELLs
@@ -286,16 +286,16 @@ class TestMinSellConfidenceGate:
         journal = MagicMock(spec=TradeJournal)
         journal.get_position_state.return_value = None
 
-        data = MagicMock()
-        data.current_price = 100.0
-        data.entry_price = 95.0
-        data.sentiment = "NEUTRAL"
-        data.consensus = "flat"
-        data.polymarket_odds = ""
-        data.volatility = None
-        data.indicators = None
-        data.pnl_pct = 0.0
-        data.position_age_hours = 1.0
+        data = MarketData(
+            ticker="BTC/USDT",
+            current_price=100.0,
+            entry_price=95.0,
+            sentiment="NEUTRAL",
+            consensus="flat",
+            polymarket_odds="",
+            pnl_pct=0.0,
+            position_age_hours=1.0,
+        )
 
         guardian = MagicMock()
         notifier = MagicMock()

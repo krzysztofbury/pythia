@@ -2,6 +2,7 @@
 .env
 .env.*.local
 .qnap.setup
+deploy/qnap/*.env
 
 # Python
 __pycache__/

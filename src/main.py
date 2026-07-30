@@ -1,12 +1,18 @@
-"""Main execution loop — boot, logging, cycle orchestration."""
+"""Oracle Pythia v10 boot, exact recovery, and cycle orchestration."""
 
-import datetime
+from __future__ import annotations
+
+import datetime as dt
+import hashlib
+import json
 import logging
 import logging.handlers
+import os
 import signal
 import sys
-import threading
 import time
+import uuid
+from decimal import Decimal
 from pathlib import Path
 
 from analytics import PortfolioAnalyzer
@@ -15,61 +21,77 @@ from config import Settings
 from data_pipeline import collect_all_market_data
 from decision_engine import evaluate_entry, evaluate_exit
 from exchange import KrakenExchange
+from execution_coordinator import ExecutionCoordinator, RecoverySummary
+from execution_store import ExecutionStore, PositionSnapshot
 from forecast import PriceForecaster
+from health import HealthReporter, HealthState
 from indicators import TechnicalAnalyzer
 from journal import TradeJournal
-from llm_challenger import LLMChallenger
+from llm_budget import LLMBudgetManager
+from llm_challenger import LLMChallenger, build_challenger_from_settings
+from models import FullCycleContext, MarketData
 from notifier import NullNotifier, WebhookNotifier
-from order_executor import reconcile_fills, reconcile_stale_orders
-from paper_portfolio import PaperPortfolio
-from portfolio_manager import classify_tickers, compute_available_slots
+from order_executor import ensure_stop_loss
+from paper_exchange import MarketRules, PaperExchange
+from portfolio_manager import classify_tickers, compute_available_slots, reserved_entry_tickers
+from redaction import RedactingFilter, RedactingFormatter, Redactor
 from risk_guardian import RiskGuardian, check_daily_loss_limit
+from runtime_state import MutationRejectedError, RuntimeState
 from sentiment import SentimentOracle
+from singleton import ProcessSingleton
 from strategy import Strategist
 from volatility import VolatilityAnalyzer
 
 logger = logging.getLogger("OraclePythia")
 
+APP_VERSION = "10.0.0"
+_DROUGHT_ALERT_THROTTLE_SECONDS = 24 * 3600.0
+_drought_alert_state: dict[str, float] = {}
 
-def setup_logging(settings: Settings) -> None:
-    """Configure console and time-based file logging with daily rotation."""
+
+def setup_logging(settings: Settings) -> Redactor:
+    """Install one central redacting console/file logging pipeline."""
+    redactor = Redactor(_configured_secrets(settings))
+    formatter = RedactingFormatter(
+        "%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+        redactor=redactor,
+    )
+    redacting_filter = RedactingFilter(redactor=redactor)
     root = logging.getLogger()
     root.setLevel(logging.INFO)
-
-    formatter = logging.Formatter(
-        "%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    )
+    for handler in root.handlers[:]:
+        root.removeHandler(handler)
+        handler.close()
 
     console = logging.StreamHandler(sys.stdout)
     console.setFormatter(formatter)
+    console.addFilter(redacting_filter)
     root.addHandler(console)
 
+    log_path = Path("logs/bot.log")
+    log_path.parent.mkdir(parents=True, exist_ok=True)
     file_handler = logging.handlers.TimedRotatingFileHandler(
-        "logs/bot.log",
+        log_path,
         when="midnight",
         backupCount=settings.log_retention_days,
         encoding="utf-8",
         utc=True,
     )
     file_handler.setFormatter(formatter)
+    file_handler.addFilter(redacting_filter)
     root.addHandler(file_handler)
+    return redactor
 
 
-def _write_healthcheck(settings: Settings) -> None:
-    """Write a healthcheck timestamp file for Docker HEALTHCHECK."""
-    try:
-        path = Path(settings.healthcheck_file)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(
-            datetime.datetime.now(tz=datetime.timezone.utc).isoformat(),
-            encoding="utf-8",
-        )
-    except Exception:  # noqa: BLE001
-        logger.debug("Failed to write healthcheck file.", exc_info=True)
-
-
-_DROUGHT_ALERT_THROTTLE_SECONDS = 24 * 3600.0
-_drought_alert_state: dict[str, float] = {}
+def _configured_secrets(settings: Settings) -> list[object]:
+    values: list[object] = []
+    for name in settings.__class__.model_fields:
+        value = getattr(settings, name)
+        if value is not None and any(
+            marker in name for marker in ("key", "secret", "ack", "account_id", "url", "proxy")
+        ):
+            values.append(value)
+    return values
 
 
 def check_entry_drought(
@@ -79,45 +101,38 @@ def check_entry_drought(
     *,
     _state: dict[str, float] | None = None,
 ) -> bool:
-    """Alert when a LIVE bot has not opened a position for too long.
-
-    The bot executed zero entries between 2026-04-23 and 2026-06-11 without
-    a single notification — silence must be treated as a failure mode.
-    Returns True when an alert was sent. Throttled to once per 24h.
-    """
+    """Alert at most daily when an armed LIVE process has no reconciled BUY fills."""
     state = _drought_alert_state if _state is None else _state
     if settings.trading_mode != "LIVE" or settings.no_entry_alert_hours <= 0:
         return False
-
-    last_entry = journal.get_last_entry_timestamp()
-    now = datetime.datetime.now(tz=datetime.timezone.utc)
+    last_entry = journal.get_last_entry_timestamp(account=f"Kraken-{settings.trading_mode}")
+    now = dt.datetime.now(tz=dt.UTC)
+    threshold_seconds = settings.no_entry_alert_hours * 3600.0
     if last_entry is not None:
-        idle_hours = (now - last_entry).total_seconds() / 3600.0
-        if idle_hours < settings.no_entry_alert_hours:
+        if (now - last_entry).total_seconds() < threshold_seconds:
             return False
-    # No entry ever recorded counts as a drought: a LIVE bot that has never
-    # bought anything is exactly the silent state this alert exists for.
-
+    else:
+        # Fresh journal (v10 cutover, restart): measure the drought from the
+        # first armed check, not from epoch — otherwise every cold start
+        # alerts "for ever" immediately and trains the operator to ignore it.
+        none_since = state.setdefault("none_since_monotonic", time.monotonic())
+        if time.monotonic() - none_since < threshold_seconds:
+            return False
     last_alert = state.get("last_alert_monotonic")
-    if last_alert is not None and (time.monotonic() - last_alert) < _DROUGHT_ALERT_THROTTLE_SECONDS:
+    if last_alert is not None and time.monotonic() - last_alert < _DROUGHT_ALERT_THROTTLE_SECONDS:
         return False
-
     idle_desc = f"{(now - last_entry).days}d" if last_entry is not None else "ever"
     message = (
-        f"Entry drought: no BUY executed for {idle_desc} "
-        f"(threshold {settings.no_entry_alert_hours:.0f}h). "
-        "Check sentiment provider credits, guardian rejections, and balance."
+        f"Entry drought: no reconciled BUY fill for {idle_desc} "
+        f"(threshold {settings.no_entry_alert_hours:.0f}h)."
     )
     logger.warning(message)
-    try:
-        notifier.notify_error(message)
-    except Exception:  # noqa: BLE001
-        logger.debug("notify_error failed for entry-drought alert", exc_info=True)
+    notifier.notify_error(message)
     state["last_alert_monotonic"] = time.monotonic()
     return True
 
 
-def run_cycle(  # noqa: PLR0913
+def run_cycle(  # noqa: C901, PLR0912, PLR0913, PLR0915
     settings: Settings,
     exchange: KrakenExchange,
     oracle: SentimentOracle,
@@ -129,247 +144,590 @@ def run_cycle(  # noqa: PLR0913
     vol_analyzer: VolatilityAnalyzer | None = None,
     price_forecaster: PriceForecaster | None = None,
     portfolio_analyzer: PortfolioAnalyzer | None = None,
-    paper_portfolio: PaperPortfolio | None = None,
+    _legacy_paper_portfolio: object | None = None,
     challenger: LLMChallenger | None = None,
+    *,
+    coordinator: ExecutionCoordinator,
+    execution_store: ExecutionStore,
+    runtime: RuntimeState,
+    execution_venue: KrakenExchange | PaperExchange,
+    health: HealthReporter | None = None,
+    full_cycle_context: FullCycleContext | None = None,
+    cycle_id: str | None = None,
+    force_full_cycle: bool | None = None,
+    paper_state_path: str | Path | None = None,
 ) -> None:
-    """Execute one complete trading analysis cycle (2-pass system)."""
+    """Run one recovery-first cycle against an exact execution venue."""
+    del _legacy_paper_portfolio
     cycle_start = time.monotonic()
-
-    is_full_cycle = not hasattr(run_cycle, "_last_full") or (
-        time.time() - run_cycle._last_full >= settings.full_cycle_seconds
+    cycle_id = cycle_id or f"cycle-{time.time_ns()}"
+    context = full_cycle_context or FullCycleContext()
+    is_full_cycle = (
+        context.observed_at is None
+        or cycle_start - context.observed_at >= settings.full_cycle_seconds
+        if force_full_cycle is None
+        else force_full_cycle
     )
-    if is_full_cycle:
-        run_cycle._last_full = time.time()
-
+    if health is not None:
+        health.mark_cycle_started(settings.timeout_seconds)
     logger.info(
-        "Starting %s Cycle. Mode: %s",
+        "Starting %s cycle id=%s mode=%s",
         "FULL" if is_full_cycle else "FAST",
+        cycle_id,
         settings.trading_mode,
     )
 
-    cached_exchange = CachedExchange(exchange)
-    guardian.exchange = cached_exchange
+    market_exchange = CachedExchange(exchange)
+    execution_exchange = CachedExchange(execution_venue)
+    guardian.exchange = execution_exchange
+    guardian.market_exchange = market_exchange
+    guardian.execution_store = execution_store
 
-    reconcile_stale_orders(settings, exchange, journal)
+    try:
+        if isinstance(execution_venue, PaperExchange):
+            _feed_paper_market_events(settings, market_exchange, execution_venue)
 
-    if settings.trading_mode == "LIVE":
-        reconcile_fills(
-            tickers=settings.universe_list,
-            exchange=exchange,
-            journal=journal,
-            notifier=notifier,
-            quote_currency=settings.quote_currency,
-            tax_rate=settings.tax_rate,
+        recovery = _recover_runtime(
+            settings,
+            coordinator,
+            execution_store,
+            journal,
+            notifier,
+            runtime,
+            health,
         )
+        if recovery is None:
+            logger.warning("Cycle aborted because exact recovery did not complete.")
+            return
+        try:
+            with runtime.mutation_section():
+                coordinator.cancel_stale_entries(settings.stale_order_max_age_seconds)
+        except MutationRejectedError:
+            logger.info("Stale cancellation skipped because the runtime is draining.")
+        if not coordinator.ready:
+            runtime.mark_not_ready()
 
-    if is_full_cycle:
-        fear_greed = oracle.get_fear_and_greed_index()
-        run_cycle._cached_fear_greed = fear_greed
-    else:
-        fear_greed = getattr(run_cycle, "_cached_fear_greed", "")
-    logger.info("Market Sentiment: Fear & Greed Index = %s", fear_greed)
+        if is_full_cycle:
+            context.fear_greed = oracle.get_fear_and_greed_index()
+            context.polymarket_markets = (
+                oracle.fetch_polymarket_markets() if settings.polymarket_enabled else []
+            )
+        fear_greed = context.fear_greed
+        polymarket_markets = context.polymarket_markets or []
 
-    polymarket_markets: list[dict] = []
-    if is_full_cycle and settings.polymarket_enabled:
-        polymarket_markets = oracle.fetch_polymarket_markets()
-        run_cycle._cached_polymarket = polymarket_markets
+        owned_tickers, available_tickers = classify_tickers(
+            settings,
+            exchange,
+            execution_store=execution_store,
+        )
+        reserved_tickers = reserved_entry_tickers(execution_store)
         logger.info(
-            "Polymarket: fetched %d markets for cycle",
-            len(polymarket_markets),
+            "Universe: owned=%s reserved=%s available=%s",
+            owned_tickers,
+            sorted(reserved_tickers),
+            available_tickers,
         )
-    elif not is_full_cycle:
-        polymarket_markets = getattr(run_cycle, "_cached_polymarket", [])
+        available_slots = compute_available_slots(
+            len(available_tickers),
+            len(owned_tickers) + len(reserved_tickers),
+            settings.max_total_crypto_positions,
+        )
+        entry_slots_remaining = max(
+            settings.max_total_crypto_positions - len(owned_tickers) - len(reserved_tickers),
+            0,
+        )
+        positions = {
+            position.symbol: position for position in execution_store.list_open_positions()
+        }
+        has_position_map = {ticker: ticker in positions for ticker in settings.universe_list}
+        buy_price_map = {
+            ticker: float(position.average_cost) if (position := positions.get(ticker)) else None
+            for ticker in settings.universe_list
+        }
+        all_tickers = owned_tickers + available_tickers
+        all_data = collect_all_market_data(
+            all_tickers,
+            settings,
+            market_exchange,
+            oracle,
+            journal,
+            fear_greed,
+            polymarket_markets,
+            tech_analyzer,
+            vol_analyzer if is_full_cycle else None,
+            price_forecaster if is_full_cycle else None,
+            has_position_map,
+            buy_price_map,
+        )
+        _apply_quantitative_context(
+            settings,
+            all_data,
+            context,
+            cycle_start,
+            is_full_cycle=is_full_cycle,
+        )
+        _apply_position_ages(all_data, positions)
 
-    owned_tickers, available_tickers = classify_tickers(
-        settings,
-        exchange,
-        cached_exchange,
-        paper_portfolio,
-    )
-    logger.info(
-        "Universe: %d owned %s, %d available %s",
-        len(owned_tickers),
-        owned_tickers,
-        len(available_tickers),
-        available_tickers,
-    )
-
-    available_slots = compute_available_slots(
-        n_available=len(available_tickers),
-        n_owned=len(owned_tickers),
-        max_total=settings.max_total_crypto_positions,
-    )
-
-    daily_loss_ok = check_daily_loss_limit(journal, settings)
-
-    has_position_map: dict[str, bool] = {}
-    buy_price_map: dict[str, float | None] = {}
-    for ticker in owned_tickers:
-        has_position_map[ticker] = True
-        buy_price_map[ticker] = journal.get_average_cost_basis(
-            ticker,
-        ) or journal.get_last_buy_price(ticker)
-    for ticker in available_tickers:
-        has_position_map[ticker] = False
-        buy_price_map[ticker] = None
-
-    cycle_vol_analyzer = vol_analyzer if is_full_cycle else None
-    cycle_price_forecaster = price_forecaster if is_full_cycle else None
-
-    all_tickers = owned_tickers + available_tickers
-    all_data = collect_all_market_data(
-        all_tickers,
-        settings,
-        cached_exchange,
-        oracle,
-        journal,
-        fear_greed,
-        polymarket_markets,
-        tech_analyzer,
-        cycle_vol_analyzer,
-        cycle_price_forecaster,
-        has_position_map,
-        buy_price_map,
-    )
-
-    for ticker in owned_tickers:
-        data = all_data.get(ticker)
-        if not data:
-            continue
-        try:
-            evaluate_exit(
-                ticker,
-                data,
-                settings,
-                cached_exchange,
-                strategist,
-                guardian,
-                journal,
-                notifier,
-                available_slots,
-                paper_portfolio,
-                challenger=challenger,
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "Error in exit evaluation for %s: %s",
-                ticker,
-                exc,
-            )
-            notifier.notify_error(
-                f"Exit evaluation failed for {ticker}: {exc}",
-            )
-
-    if daily_loss_ok:
-        entries_this_cycle = 0
-        # Intra-cycle budget prevents a 2nd entry from re-using stale cached
-        # balance — otherwise two tier-4 entries could each allocate 40% of
-        # balance in one cycle, producing an 80% concentration spike.
-        try:
-            cycle_budget_usd = cached_exchange.get_free_balance(settings.quote_currency)
-        except Exception:  # noqa: BLE001
-            logger.warning("Failed to read cycle starting balance; skipping budget cap.")
-            cycle_budget_usd = float("inf")
-        for ticker in available_tickers:
-            if entries_this_cycle >= settings.max_entries_per_cycle:
-                logger.info(
-                    "Entry limit reached (%d/%d). Skipping remaining tickers.",
-                    entries_this_cycle,
-                    settings.max_entries_per_cycle,
-                )
-                break
+        exit_order_count_before = _exit_order_count(execution_store)
+        for ticker in owned_tickers:
             data = all_data.get(ticker)
-            if not data:
+            if data is None:
                 continue
             try:
-                bought, spent_usd = evaluate_entry(
-                    ticker,
-                    data,
+                if coordinator.ready:
+                    evaluate_exit(
+                        ticker,
+                        data,
+                        settings,
+                        market_exchange,
+                        strategist,
+                        guardian,
+                        journal,
+                        notifier,
+                        available_slots,
+                        challenger=challenger,
+                        coordinator=coordinator,
+                        execution_store=execution_store,
+                        runtime=runtime,
+                        cycle_id=cycle_id,
+                    )
+                elif coordinator.protection_remediation_only:
+                    # Protection-gap issues must not freeze exit management:
+                    # restore the exchange stop first, then let the exit path
+                    # retry — a successful protected exit resolves stale
+                    # handoff failures for the symbol.
+                    ensure_stop_loss(
+                        ticker,
+                        data,
+                        settings,
+                        market_exchange,
+                        coordinator=coordinator,
+                        execution_store=execution_store,
+                        runtime=runtime,
+                    )
+                    evaluate_exit(
+                        ticker,
+                        data,
+                        settings,
+                        market_exchange,
+                        strategist,
+                        guardian,
+                        journal,
+                        notifier,
+                        available_slots,
+                        challenger=challenger,
+                        coordinator=coordinator,
+                        execution_store=execution_store,
+                        runtime=runtime,
+                        cycle_id=cycle_id,
+                    )
+                else:
+                    logger.warning(
+                        "Exit mutation skipped for %s while exact recovery is unresolved.",
+                        ticker,
+                    )
+            except Exception as error:  # noqa: BLE001
+                logger.warning("Exit evaluation failed for %s: %s", ticker, error)
+                notifier.notify_error(f"Exit evaluation failed for {ticker}: {error}")
+
+        exit_activity = _exit_order_count(execution_store) > exit_order_count_before
+        active_exit = any(
+            order["purpose"] == "EXIT"
+            for order in execution_store.list_order_contexts(active_only=True)
+        )
+        if exit_activity or active_exit:
+            if (
+                _recover_runtime(
                     settings,
-                    cached_exchange,
-                    strategist,
-                    guardian,
+                    coordinator,
+                    execution_store,
                     journal,
                     notifier,
-                    available_slots,
-                    owned_tickers,
-                    paper_portfolio,
-                    challenger=challenger,
-                    budget_usd=cycle_budget_usd,
+                    runtime,
+                    health,
                 )
-                if bought:
-                    entries_this_cycle += 1
-                    available_slots = max(available_slots - 1, 1)
-                    owned_tickers.append(ticker)
-                    cycle_budget_usd = max(cycle_budget_usd - spent_usd, 0.0)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    "Error in entry evaluation for %s: %s",
-                    ticker,
-                    exc,
+                is None
+            ):
+                logger.warning("Entries blocked because post-exit recovery failed.")
+            exit_activity = True
+
+        # Exact post-exit fills must affect the daily-loss gate before another entry.
+        daily_loss_ok = check_daily_loss_limit(execution_store, settings)
+        if daily_loss_ok and runtime.ready and coordinator.ready and not exit_activity:
+            entries_this_cycle = 0
+            try:
+                cycle_budget_usd = float(
+                    execution_exchange.get_free_balance(settings.quote_currency),
                 )
-                notifier.notify_error(
-                    f"Entry evaluation failed for {ticker}: {exc}",
-                )
+            except Exception:
+                logger.exception("Execution venue balance read failed; all entries are blocked.")
+                cycle_budget_usd = 0.0
+            exposure_tickers = [*owned_tickers, *sorted(reserved_tickers)]
+            for ticker in available_tickers:
+                if entries_this_cycle >= settings.max_entries_per_cycle:
+                    break
+                if entry_slots_remaining <= 0:
+                    break
+                data = all_data.get(ticker)
+                if data is None:
+                    continue
+                try:
+                    submitted, reserved_usd = evaluate_entry(
+                        ticker,
+                        data,
+                        settings,
+                        market_exchange,
+                        strategist,
+                        guardian,
+                        journal,
+                        notifier,
+                        available_slots,
+                        exposure_tickers,
+                        challenger=challenger,
+                        budget_usd=cycle_budget_usd,
+                        coordinator=coordinator,
+                        execution_store=execution_store,
+                        runtime=runtime,
+                        cycle_id=cycle_id,
+                    )
+                    if submitted:
+                        entries_this_cycle += 1
+                        entry_slots_remaining -= 1
+                        available_slots = max(entry_slots_remaining, 1)
+                        exposure_tickers.append(ticker)
+                        cycle_budget_usd = max(cycle_budget_usd - reserved_usd, 0.0)
+                except Exception as error:  # noqa: BLE001
+                    logger.warning("Entry evaluation failed for %s: %s", ticker, error)
+                    notifier.notify_error(f"Entry evaluation failed for {ticker}: {error}")
+        else:
+            logger.info("Entries blocked by daily loss or reconciliation readiness.")
+
+        if portfolio_analyzer is not None:
+            portfolio_analyzer.log_summary()
+        if settings.live_entries_enabled:
+            check_entry_drought(journal, settings, notifier)
+        if health is not None:
+            health.mark_cycle_completed()
+            health.set_state(
+                HealthState.READY if runtime.ready and coordinator.ready else HealthState.DEGRADED,
+                error_codes=()
+                if runtime.ready and coordinator.ready
+                else ("RECONCILIATION_PENDING",),
+            )
+        duration_seconds = time.monotonic() - cycle_start
+        logger.info("Cycle complete id=%s duration=%.1fs", cycle_id, duration_seconds)
+        notifier.notify_cycle_summary(f"Cycle {cycle_id} completed in {duration_seconds:.1f}s")
+    finally:
+        if isinstance(execution_venue, PaperExchange) and paper_state_path is not None:
+            _save_paper_exchange(execution_venue, paper_state_path, execution_store)
+
+
+def _recover_runtime(  # noqa: PLR0913
+    settings: Settings,
+    coordinator: ExecutionCoordinator,
+    store: ExecutionStore,
+    journal: TradeJournal,
+    notifier: WebhookNotifier | NullNotifier,
+    runtime: RuntimeState,
+    health: HealthReporter | None,
+) -> RecoverySummary | None:
+    """Run exact recovery, publish fills, and derive runtime readiness."""
+    if health is not None and not runtime.ready:
+        health.set_state(HealthState.RECOVERING)
+    try:
+        summary = coordinator.recover(
+            settings.universe_list,
+            Decimal(str(settings.reconciliation_balance_tolerance)),
+        )
+        _publish_reconciled_fills(summary, store, journal, notifier, settings)
+        if health is not None:
+            health.mark_reconciliation()
+    except Exception:
+        logger.exception("Exact recovery failed; entries remain blocked.")
+        runtime.mark_not_ready()
+        if health is not None:
+            health.set_state(HealthState.DEGRADED, error_codes=("RECOVERY_FAILED",))
+        return None
+    if summary.readiness.ready:
+        runtime.mark_ready()
     else:
-        logger.info("Skipping entries due to daily loss limit.")
+        runtime.mark_not_ready()
+        logger.warning("Exact recovery has %d unresolved issue(s).", len(summary.readiness.issues))
+    return summary
 
-    if portfolio_analyzer:
-        portfolio_analyzer.log_summary()
 
-    check_entry_drought(journal, settings, notifier)
+def _publish_reconciled_fills(
+    summary: RecoverySummary,
+    store: ExecutionStore,
+    journal: TradeJournal,
+    notifier: WebhookNotifier | NullNotifier,
+    settings: Settings,
+) -> None:
+    """Mirror every durable, previously unpublished fill into analytics."""
+    _ = summary
+    rows = store.connection.execute(
+        "SELECT fill_id, symbol, side, price, quantity, cost, fee, executed_at_ms "
+        "FROM fills ORDER BY executed_at_ms, fill_id COLLATE BINARY",
+    ).fetchall()
+    for row in rows:
+        fill_id = str(row["fill_id"])
+        if journal.is_fill_recorded(fill_id):
+            continue
+        realized_row = store.connection.execute(
+            "SELECT realized_pnl FROM position_events WHERE fill_id = ?",
+            (fill_id,),
+        ).fetchone()
+        realized = Decimal(0) if realized_row is None else Decimal(str(realized_row[0]))
+        side = str(row["side"])
+        price = Decimal(str(row["price"]))
+        quantity = Decimal(str(row["quantity"]))
+        fee = Decimal(str(row["fee"]))
+        symbol = str(row["symbol"])
+        quote = symbol.split("/", maxsplit=1)[1]
+        timestamp = dt.datetime.fromtimestamp(int(row["executed_at_ms"]) / 1000, tz=dt.UTC)
+        tax = max(realized, Decimal(0)) * Decimal(str(settings.tax_rate))
+        journal.log_trade(
+            account=f"Kraken-{settings.trading_mode}",
+            instrument=symbol,
+            side=side,
+            price=float(price),
+            quantity=float(quantity),
+            value=float(Decimal(str(row["cost"]))),
+            currency=quote,
+            reasoning=f"Exact reconciled fill [{fill_id}]",
+            profit=float(realized),
+            tax=float(tax),
+            fee=float(fee),
+            fill_source="exchange",
+            exchange_fill_id=fill_id,
+            timestamp=timestamp,
+        )
+        notifier.notify_trade(
+            symbol,
+            side,
+            float(price),
+            float(quantity),
+            f"Exact reconciled fill [{fill_id}]",
+        )
+        if store.get_position(symbol) is None:
+            journal.delete_position_state(symbol)
 
-    _write_healthcheck(settings)
 
-    cycle_duration_seconds = time.monotonic() - cycle_start
-    logger.info("Cycle Complete. Duration: %.1fs", cycle_duration_seconds)
-    notifier.notify_cycle_summary(
-        f"Cycle done in {cycle_duration_seconds:.1f}s",
+def _exit_order_count(store: ExecutionStore) -> int:
+    """Return durable exit intent count for current-cycle mutation detection."""
+    return sum(1 for order in store.list_order_contexts() if order["purpose"] == "EXIT")
+
+
+def _apply_quantitative_context(
+    settings: Settings,
+    data_by_ticker: dict[str, MarketData],
+    context: FullCycleContext,
+    observed_at: float,
+    *,
+    is_full_cycle: bool,
+) -> None:
+    """Cache FULL outputs or inject only a still-fresh cache into FAST data."""
+    assert context.volatility_by_ticker is not None  # noqa: S101
+    assert context.forecast_by_ticker is not None  # noqa: S101
+    volatility_cache = context.volatility_by_ticker
+    forecast_cache = context.forecast_by_ticker
+    if is_full_cycle:
+        context.observed_at = observed_at
+        volatility_cache.clear()
+        forecast_cache.clear()
+        for ticker, data in data_by_ticker.items():
+            if data.volatility is not None:
+                volatility_cache[ticker] = data.volatility
+            if data.forecast is not None:
+                forecast_cache[ticker] = data.forecast
+    age = None if context.observed_at is None else observed_at - context.observed_at
+    cache_fresh = age is not None and 0 <= age <= settings.full_cycle_seconds
+    for ticker, data in data_by_ticker.items():
+        if not is_full_cycle and cache_fresh:
+            data.volatility = volatility_cache.get(ticker)  # type: ignore[assignment]
+            data.forecast = forecast_cache.get(ticker)  # type: ignore[assignment]
+        required_volatility = settings.garch_enabled
+        required_forecast = settings.arima_enabled
+        data.quantitative_context_fresh = (
+            cache_fresh
+            and (not required_volatility or data.volatility is not None)
+            and (not required_forecast or data.forecast is not None)
+        )
+        data.quantitative_context_observed_at = context.observed_at
+
+
+def _apply_position_ages(
+    data_by_ticker: dict[str, MarketData],
+    positions: dict[str, PositionSnapshot],
+) -> None:
+    """Derive entry price and age only from reconciled ExecutionStore positions."""
+    now_ms = int(time.time() * 1000)
+    for ticker, data in data_by_ticker.items():
+        position = positions.get(ticker)
+        if position is None:
+            data.has_position = False
+            data.entry_price = None
+            data.position_age_hours = None
+            continue
+        data.has_position = True
+        data.entry_price = float(position.average_cost)
+        data.position_age_hours = max(now_ms - position.opened_at_ms, 0) / 3_600_000
+
+
+def _feed_paper_market_events(
+    settings: Settings,
+    market_exchange: CachedExchange,
+    paper_exchange: PaperExchange,
+) -> None:
+    """Advance PAPER orders with fresh quotes before any new decision is evaluated."""
+    state_clock = int(paper_exchange.to_state()["sequences"]["clock"])
+    base_timestamp = max(int(time.time() * 1000) - len(settings.universe_list), state_clock + 1)
+    for index, symbol in enumerate(settings.universe_list):
+        structure = market_exchange.get_market_structure(symbol)
+        paper_exchange.process_market_event(
+            symbol,
+            bid=structure["bid"],
+            ask=structure["ask"],
+            last=market_exchange.fetch_price(symbol),
+            timestamp=base_timestamp + index,
+        )
+
+
+def _paper_markets(settings: Settings) -> dict[str, MarketRules]:
+    """Build deterministic high-precision PAPER rules for the configured universe."""
+    markets: dict[str, MarketRules] = {}
+    for symbol in settings.universe_list:
+        base, quote = symbol.split("/", maxsplit=1)
+        markets[symbol] = MarketRules(
+            base,
+            quote,
+            price_increment="0.000000000000000000000001",
+            amount_increment="0.000000000000000000000001",
+            min_notional="10",
+            min_amount="0.000000000000000000000001",
+        )
+    return markets
+
+
+def _load_paper_exchange(settings: Settings) -> PaperExchange:
+    path = Path(settings.paper_exchange_state_path)
+    if path.exists():
+        state = json.loads(path.read_text(encoding="utf-8"))
+        exchange = PaperExchange.from_state(state)
+        if any(not exchange.symbol_exists(symbol) for symbol in settings.universe_list):
+            message = "paper exchange checkpoint does not match the configured universe"
+            raise ValueError(message)
+        return exchange
+    balances = {settings.quote_currency: Decimal(str(settings.paper_initial_balance_usd))}
+    balances.update(
+        {symbol.split("/", maxsplit=1)[0]: Decimal(0) for symbol in settings.universe_list},
+    )
+    return PaperExchange(
+        balances,
+        _paper_markets(settings),
+        start_timestamp=int(time.time() * 1000),
     )
 
 
-def main() -> None:
-    """Entry point for the bot."""
+def _save_paper_exchange(
+    exchange: PaperExchange,
+    state_path: str | Path,
+    execution_store: ExecutionStore | None = None,
+) -> None:
+    """Atomically checkpoint PAPER cash, reservations, orders, and sequences."""
+    if execution_store is not None:
+        pending_fill_ids = {
+            str(fill["id"])
+            for fill in exchange.fetch_my_trades()
+            if execution_store.connection.execute(
+                "SELECT 1 FROM fills WHERE fill_id = ?",
+                (str(fill["id"]),),
+            ).fetchone()
+            is None
+        }
+        if pending_fill_ids:
+            message = "PAPER checkpoint refused because exact fills are not durable"
+            raise RuntimeError(message)
+    path = Path(state_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        with temporary.open("x", encoding="utf-8") as state_file:
+            json.dump(exchange.to_state(), state_file, sort_keys=True, separators=(",", ":"))
+            state_file.write("\n")
+            state_file.flush()
+            os.fsync(state_file.fileno())
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _execution_scope(settings: Settings) -> str:
+    if settings.trading_mode == "PAPER":
+        return "paper:kraken:local"
+    assert settings.trading_account_id is not None  # noqa: S101
+    account = settings.trading_account_id.get_secret_value()
+    digest = hashlib.sha256(account.encode()).hexdigest()[:16]
+    return f"live:kraken:{digest}"
+
+
+def main() -> int:  # noqa: C901, PLR0912, PLR0915
+    """Initialize all v10 resources, run until drain, and return a process exit code."""
     try:
         settings = Settings()
-    except Exception:  # noqa: BLE001
+    except Exception:
         logging.basicConfig(level=logging.INFO)
-        logger.critical("Failed to load initial settings. Exiting.")
-        return
+        logger.critical("Failed to load settings.", exc_info=True)
+        return 1
 
-    setup_logging(settings)
-    logger.info("--- ORACLE PYTHIA BOOTING VERSION 9.7 ---")
-    logger.info(
-        "Effective config: mode=%s quote=%s universe=%s conviction_sizing=%s "
-        "challenger=%s funding=%s sentiment_model=%s fallback=%s "
-        "sentiment_cache=%ss require_bullish=%s",
-        settings.trading_mode,
-        settings.quote_currency,
-        settings.universe_list,
-        settings.conviction_sizing_enabled,
-        settings.challenger_enabled,
-        settings.funding_rates_enabled,
-        settings.sentiment_model,
-        settings.sentiment_fallback_model or "(none)",
-        settings.sentiment_cache_seconds,
-        settings.require_bullish_sentiment,
-    )
-
-    shutdown_event = threading.Event()
-
-    def signal_handler(_signum: int, _frame: object) -> None:
-        logger.info("Shutdown signal received. Exiting...")
-        shutdown_event.set()
-
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
-
-    logger.info("Oracle Pythia Bot Started.")
-
+    redactor = setup_logging(settings)
+    logger.info("Oracle Pythia v10 booting mode=%s", settings.trading_mode)
+    singleton: ProcessSingleton | None = None
+    runtime: RuntimeState | None = None
+    health: HealthReporter | None = None
+    store: ExecutionStore | None = None
+    journal: TradeJournal | None = None
+    paper_exchange: PaperExchange | None = None
+    exchange: KrakenExchange | None = None
+    exit_code = 0
     try:
-        exchange = KrakenExchange(
-            settings.kraken_api_key,
-            settings.kraken_private_key,
+        mode_lock = Path(settings.singleton_lock_path).with_name(
+            f"{Path(settings.singleton_lock_path).stem}-{settings.trading_mode.lower()}.lock",
+        )
+        singleton = ProcessSingleton(mode_lock)
+        singleton.acquire()
+        runtime = RuntimeState()
+        signal.signal(signal.SIGTERM, runtime.handle_signal)
+        signal.signal(signal.SIGINT, runtime.handle_signal)
+        health = HealthReporter(
+            settings.healthcheck_file,
+            app_version=APP_VERSION,
+            build_version=os.environ.get("BUILD_VERSION", "local"),
+        )
+        exchange = KrakenExchange(settings.kraken_api_key, settings.kraken_private_key)
+        store = ExecutionStore(settings.state_db_path, _execution_scope(settings))
+        journal = TradeJournal(db_path=settings.analytics_db_path)
+        budget = LLMBudgetManager(
+            settings.llm_budget_db_path,
+            daily_cap_usd=settings.llm_daily_shadow_budget_usd,
+            monthly_cap_usd=settings.llm_monthly_budget_usd,
+            shadow_cap_usd=settings.llm_monthly_budget_usd,
+        )
+        execution_venue: KrakenExchange | PaperExchange = exchange
+        if settings.trading_mode == "PAPER":
+            paper_exchange = _load_paper_exchange(settings)
+            execution_venue = paper_exchange
+        coordinator = ExecutionCoordinator(
+            store,
+            execution_venue,
+            live_entries_enabled=(
+                settings.trading_mode == "PAPER" or settings.live_entries_enabled
+            ),
+        )
+        notifier: WebhookNotifier | NullNotifier = (
+            WebhookNotifier(settings.webhook_url, settings.error_webhook_url, redactor=redactor)
+            if settings.webhook_url
+            else NullNotifier()
         )
         extra_api_keys = {
             provider: key.get_secret_value()
@@ -388,77 +746,99 @@ def main() -> None:
             fallback_model=settings.sentiment_fallback_model,
             extra_api_keys=extra_api_keys,
             cache_ttl_seconds=settings.sentiment_cache_seconds,
+            enabled=settings.sentiment_enabled,
+            budget_manager=budget,
+            max_tokens=settings.llm_max_tokens,
+            timeout_seconds=settings.llm_timeout_seconds,
         )
+        guardian = RiskGuardian(
+            settings,
+            execution_venue,
+            market_exchange=exchange,
+            execution_store=store,
+        )
+        challenger = build_challenger_from_settings(settings, budget)
         strategist = Strategist(settings=settings)
-        guardian = RiskGuardian(settings, exchange)
-        journal = TradeJournal()
-
-        notifier: WebhookNotifier | NullNotifier
-        if settings.webhook_url:
-            notifier = WebhookNotifier(
-                settings.webhook_url,
-                settings.error_webhook_url,
-            )
-        else:
-            notifier = NullNotifier()
-
-        paper_portfolio: PaperPortfolio | None = None
-        if settings.trading_mode == "PAPER":
-            paper_portfolio = PaperPortfolio(
-                initial_balance=(settings.max_position_size_usd * len(settings.universe_list)),
-                quote_currency=settings.quote_currency,
-                db_path=str(journal.db_path),
-            )
-
-        tech_analyzer = TechnicalAnalyzer()
-        vol_analyzer = VolatilityAnalyzer()
-        price_forecaster = PriceForecaster(
-            max_order=settings.arima_max_order,
-        )
+        technical = TechnicalAnalyzer()
+        volatility = VolatilityAnalyzer()
+        forecaster = PriceForecaster(max_order=settings.arima_max_order)
         portfolio_analyzer = PortfolioAnalyzer(journal=journal)
-        from llm_challenger import build_challenger_from_settings
+        full_context = FullCycleContext()
 
-        challenger = build_challenger_from_settings(settings)
-        logger.info(
-            "LLM Challenger: enabled=%s model=%s",
-            challenger.enabled,
-            settings.challenger_model if challenger.enabled else "(off)",
-        )
-    except Exception:  # noqa: BLE001
-        logger.critical("Component initialization failed. Exiting.")
-        return
-
-    while not shutdown_event.is_set():
-        try:
-            run_cycle(
-                settings,
-                exchange,
-                oracle,
-                strategist,
-                guardian,
-                journal,
-                notifier,
-                tech_analyzer,
-                vol_analyzer,
-                price_forecaster,
-                portfolio_analyzer,
-                paper_portfolio,
-                challenger=challenger,
-            )
-        except Exception:
-            logger.exception("Cycle failed with unhandled error.")
-            notifier.notify_error("Cycle failed with unhandled error.")
-
-        if not shutdown_event.is_set():
-            logger.info(
-                "Sleeping for %s seconds ...",
-                settings.entry_cycle_seconds,
-            )
-            if shutdown_event.wait(timeout=settings.entry_cycle_seconds):
+        _recover_runtime(settings, coordinator, store, journal, notifier, runtime, health)
+        while not runtime.shutdown_event.is_set():
+            try:
+                run_cycle(
+                    settings,
+                    exchange,
+                    oracle,
+                    strategist,
+                    guardian,
+                    journal,
+                    notifier,
+                    technical,
+                    volatility,
+                    forecaster,
+                    portfolio_analyzer,
+                    challenger=challenger,
+                    coordinator=coordinator,
+                    execution_store=store,
+                    runtime=runtime,
+                    execution_venue=execution_venue,
+                    health=health,
+                    full_cycle_context=full_context,
+                    paper_state_path=(
+                        settings.paper_exchange_state_path
+                        if settings.trading_mode == "PAPER"
+                        else None
+                    ),
+                )
+            except Exception:
+                logger.exception("Cycle failed with an unhandled error.")
+                notifier.notify_error("Cycle failed with an unhandled error.")
+                runtime.mark_not_ready()
+                health.set_state(HealthState.DEGRADED, error_codes=("CYCLE_FAILED",))
+            singleton.refresh()
+            health.heartbeat()
+            if runtime.shutdown_event.wait(settings.entry_cycle_seconds):
                 break
-
-    logger.info("Bot Stopped.")
+    except Exception:
+        logger.critical("Component initialization failed.", exc_info=True)
+        exit_code = 1
+    finally:
+        if runtime is not None:
+            if health is not None:
+                health.set_state(HealthState.DRAINING)
+            drained = runtime.stop(settings.shutdown_drain_timeout_seconds)
+            if not drained:
+                logger.error("Mutation drain timed out; resources are closing after the bound.")
+                exit_code = 1
+        if paper_exchange is not None:
+            try:
+                _save_paper_exchange(
+                    paper_exchange,
+                    settings.paper_exchange_state_path,
+                    store,
+                )
+            except Exception:
+                logger.exception("Final PAPER checkpoint failed.")
+                exit_code = 1
+        if journal is not None:
+            journal.close()
+        if store is not None:
+            store.close()
+        if exchange is not None:
+            close_exchange = getattr(exchange._client, "close", None)  # noqa: SLF001
+            if callable(close_exchange):
+                close_exchange()
+        if singleton is not None:
+            singleton.release()
+        if health is not None:
+            health.set_state(HealthState.STOPPED)
+    logger.info("Oracle Pythia stopped exit_code=%d", exit_code)
+    logging.shutdown()
+    return exit_code
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

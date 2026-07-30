@@ -4,9 +4,8 @@
 
 | Version | Supported |
 |---------|-----------|
-| 9.7.x   | Yes       |
-| 9.6.x   | Yes       |
-| 9.0.x – 9.5.x | No — upgrade to 9.7 (v9.6 fixed a fail-closed entry gate) |
+| 10.0.x  | Yes       |
+| 9.x     | No - retain only as a read-only archive and upgrade to 10.0.0 |
 | < 9.0   | No        |
 
 ## Reporting a Vulnerability
@@ -26,17 +25,32 @@ Oracle Pythia handles sensitive financial data and API credentials:
 - All API keys are loaded from `.env` files using `pydantic.SecretStr`
 - Keys are never logged, printed, or included in error messages. v9.1's `llm_client._sanitize` additionally scrubs anything resembling an API key from LLM error strings before they hit the log file or Discord webhook.
 - Kraken API keys should be configured with **minimal permissions**: Query Funds + Modify Orders only. **Never enable Withdrawal permissions.**
-- The primary sentiment model (v9.6+: Gemini via `SENTIMENT_MODEL`) requires its provider key (`GEMINI_API_KEY` by default). Other provider keys (Anthropic, OpenAI, xAI) are needed only for the configured fallback or the LLM Challenger. All provider HTTP calls go through LiteLLM, which is configured for read-only completions; the LLM never issues trade instructions.
+- LLM features default off. Enabling one requires keys only for its selected
+  primary/fallback providers. Provider calls go through LiteLLM; LLM output
+  never submits orders and remains shadow-only in LIVE unless influence is
+  separately armed.
 
 ### Database
-- `trades.db` contains full trading history including prices, quantities, and P&L
-- The `logs/` directory is gitignored and should never be committed
-- Database backups (`.backup-*`) contain the same sensitive data
+- `paper-execution-v10.db` or `live-execution-v10.db` is authoritative and
+  contains sensitive exact order, fill, position, and protection data.
+- `analytics-v10.db`, `llm-budget.db`, PAPER checkpoints, and all database
+  backups contain sensitive operational or financial data.
+- A v9 `trades.db` is a read-only archive, never v10 execution authority. The
+  QNAP layout mounts it separately at `/archive/v9:ro`; v10 is not configured
+  to open it.
+- The `logs/` directory and `deploy/qnap/*.env` are gitignored and must not be
+  committed.
 
 ### Docker
-- The `.env` file is mounted read-only into the container
+- Env-file values are injected at container creation and are not baked into the image
 - No secrets are baked into the Docker image
 - The WARP proxy sidecar handles Polymarket geo-restriction only
+- Bot containers run as UID/GID 10001 with a read-only root and a dedicated
+  persistent `/app/logs` volume. Verify volume write/rename ownership before
+  startup.
+- Watchtower is optional, profile-gated, and has daemon-equivalent Docker socket
+  access. Private GHCR use requires a protected read-only Docker config mount.
+  It does not perform health-gated rollback.
 
 ### Network
 - All Kraken API calls use HTTPS via CCXT
@@ -52,5 +66,7 @@ Oracle Pythia handles sensitive financial data and API credentials:
 3. Set `MAX_POSITION_PCT_OF_BALANCE` (v9.2, default 40%) and `MAX_TOTAL_CRYPTO_POSITIONS` (v9.5, default 5) to cap portfolio concentration
 4. Set `DAILY_LOSS_LIMIT_USD` to pause trading after losses
 5. Monitor via Discord/Slack webhooks (`WEBHOOK_URL`, `ERROR_WEBHOOK_URL`); v9.1 HIGH-concern LLM critiques are routed to `ERROR_WEBHOOK_URL`
-6. Review `logs/bot.log` regularly for anomalies — the boot-time `Effective config:` line (v9.5) confirms the loaded universe and feature flags
+6. Review `logs/bot.log` and the structured health document regularly for anomalies
 7. Keep your `.env` file permissions restricted: `chmod 600 .env`
+8. Record image digests before promotion and rollback by exact digest; do not
+   treat a moving tag as deployment authority
