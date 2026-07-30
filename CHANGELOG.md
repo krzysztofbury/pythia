@@ -3,7 +3,7 @@
 All notable changes to Oracle Pythia are documented here.
 The format is loosely based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [10.0.0] - 2026-07-24
+## [10.0.0] - 2026-07-30
 
 Full safety rewrite of the execution, accounting, and delivery path. Motivated
 by the v9 live-loss audit: placement-as-fill accounting, stale cost basis,
