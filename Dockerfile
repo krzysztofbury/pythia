@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7
 
-FROM ghcr.io/astral-sh/uv:0.11.3 AS uv
+FROM ghcr.io/astral-sh/uv:0.12.7 AS uv
 
 # Digest-pinned so the smoke-tested base cannot drift under a tag between
 # CI jobs; Dependabot's docker ecosystem updates the pin.
